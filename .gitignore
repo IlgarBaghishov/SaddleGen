@@ -25,6 +25,9 @@ lightning_logs/
 data/
 !saddlegen/data/
 !saddlegen/data/**
+# Re-exclude cache/build artifacts that the negation above would otherwise un-ignore.
+saddlegen/data/**/__pycache__/
+saddlegen/data/**/*.pyc
 *.lmdb
 *.h5
 *.hdf5
