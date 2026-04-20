@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+.eggs/
+build/
+dist/
+
+# PyTorch / checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Training outputs
+checkpoints/
+results/
+logs/
+wandb/
+lightning_logs/
+
+# Data directories (datasets not tracked in git)
+data/
+*.lmdb
+*.h5
+*.hdf5
+
+# NERSC / SLURM
+slurm*.log
+slurm-*.out
+*.err
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Reference codes — kept locally for design reference; will be deleted before public release
+other_codes/
