@@ -20,8 +20,11 @@ logs/
 wandb/
 lightning_logs/
 
-# Data directories (datasets not tracked in git)
+# Data directories (datasets not tracked in git) anywhere in the tree,
+# with an explicit exception for saddlegen/data/ (the source package).
 data/
+!saddlegen/data/
+!saddlegen/data/**
 *.lmdb
 *.h5
 *.hdf5
