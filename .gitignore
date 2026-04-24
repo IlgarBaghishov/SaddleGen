@@ -12,6 +12,7 @@ dist/
 *.pt
 *.pth
 *.ckpt
+*.safetensors
 
 # Training outputs
 checkpoints/
@@ -19,6 +20,17 @@ results/
 logs/
 wandb/
 lightning_logs/
+
+# Example-run artifacts: we keep light files (*.json, *.png, *.npz) committed as
+# reference experiments, but exclude per-checkpoint heavy tensors (model weights,
+# optimizer state, EMA shadow, RNG state, LR-scheduler state) and intermediate
+# epoch checkpoints entirely.
+**/checkpoint_epoch_*/
+**/checkpoint_final/model.safetensors
+**/checkpoint_final/optimizer.bin
+**/checkpoint_final/scheduler.bin
+**/checkpoint_final/ema.pt
+**/checkpoint_final/random_states_*.pkl
 
 # Data directories (datasets not tracked in git) anywhere in the tree,
 # with an explicit exception for saddlegen/data/ (the source package).

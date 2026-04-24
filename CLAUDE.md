@@ -16,7 +16,9 @@ Code targets a computational chemist who reads PyTorch fluently and knows ASE an
 
 Pretrained SO(3)-equivariant eSCN-MD architecture. Loaded via `fairchem.core.calculate.pretrained_mlip.get_predict_unit("uma-s-1p2", ...)`; the returned `MLIPPredictUnit` wraps an `AveragedModel(HydraModel)` whose `.module.backbone` we consume directly (and whose `.module.output_heads` we discard — UMA's energy/force heads are replaced by `GlobalAttn → VelocityHead`).
 
-UMA-S-1.2 is the small variant — backbone config `K4L2` (`sphere_channels=128`, `lmax=2`, `num_layers=4`, cutoff `6.0 Å`, `max_neighbors=30` non-strict). The backbone returns `{"node_embedding": (N, (lmax+1)², sphere_channels) = (N, 9, 128)}` per forward pass. Trained in bf16; we match. Param count: 6.6M active / 290M total (all 32 MoE experts merged).
+UMA-S-1.2 is the small variant — backbone config `K4L2` (`sphere_channels=128`, `lmax=2`, `num_layers=4`, cutoff `6.0 Å`, `max_neighbors=300` non-strict — verified by reading `backbone.max_neighbors` on the loaded model; earlier note of `30` in this file was incorrect). The backbone returns `{"node_embedding": (N, (lmax+1)², sphere_channels) = (N, 9, 128)}` per forward pass. Trained in bf16; we match. Param count: 6.6M active / 290M total (all 32 MoE experts merged).
+
+**Effective receptive field.** With 4 message-passing layers each looking 6 Å out, atom `i`'s per-layer neighbourhood is augmented at each step, so after 4 hops `i` has indirect access to the embeddings of atoms up to `~4 × 6 = 24 Å` away. This is larger than the Li/C test cell (17 × 20 Å), so UMA alone already reaches every atom in that system — there is no "cannot mediate distant sites" gap for Li/C, contrary to what this file's earlier `GlobalAttn` justification implied. The 200-atom 30M-run systems may approach or exceed 24 Å, at which point global mixing might start to matter — but the Li/C case does not need it.
 
 UMA's mixture-of-experts is routed by `data.dataset` (string per graph; `task_name` is exposed as a property alias). Supported routing values: `{omat, oc20, oc22, oc25, omol, odac, omc}` — full set used for our triplets. Routing happens inside the backbone via `csd_embedding(charge, spin, dataset)`, which produces per-expert coefficients consumed by the MOLE layers — so `charge` and `spin` are mandatory inputs (default `0` and `0`; `spin` is only physically consumed by the `omol` head). For training efficiency, batches should be homogeneous in `task_name` where possible to amortize the MoE coefficient-set step.
 
@@ -24,7 +26,7 @@ UMA's mixture-of-experts is routed by `data.dataset` (string per graph; `task_na
 
 ### Global attention — `GlobalAttn`
 
-Sits between the UMA backbone and the head. Solves a critical failure mode of pure local GNNs: when two independent reaction sites sit in the same cell at distances beyond UMA's cutoff (~6 Å), UMA cannot mediate between them and would predict both reactions happening simultaneously — which is not a first-order saddle (it would be a second-order saddle at best) and is physically almost never traversed. Global attention lets distant atoms "negotiate" which site reacts.
+Sits between the UMA backbone and the head. The **original motivation** was: when two independent reaction sites sit in the same cell at distances beyond UMA's cutoff (~6 Å), UMA cannot mediate between them and would predict both reactions happening simultaneously. But that argument didn't account for UMA's 4-hop message passing, which propagates information ~24 Å (see the receptive-field note above). **For Li/C specifically, GlobalAttn is not solving a real problem** — there is only one mobile atom, and UMA already sees the whole cell via MP. An empirical probe on the trained sweep-9 checkpoint shows the Li's attention weights over all 126 C atoms are near-uniform (std ≈ 1 % of the mean) and barely depend on Li's xy position (self-attention stays in 32.2-32.9 % across ±1 Å Li displacement). GlobalAttn contributes a roughly-position-independent offset to the features rather than useful mode-disambiguation. Keeping it in the architecture for larger (>24 Å) cells in the 30M run, but it can be removed (`--attn-layers 0`) on Li/C without losing anything. Verified 2026-04-21.
 
 **Architecture — invariant-weighted equivariant attention** (Option B from design discussion):
 
@@ -92,7 +94,7 @@ This was a latent bug in the initial implementation (CLAUDE.md spec previously m
 
 ### Space and endpoints
 - **Flow state:** actual Cartesian atomic coordinates `r(t) ∈ ℝ^(N×3)` in Å. UMA is always fed physical atomic positions, never displacement vectors.
-- **Endpoints:** `r(0) = r_reactant + ε_rs_pert` (perturbed reactant; Gaussian perturbation with std `σ_rs_pert` on mobile atoms), `r(1) = r_saddle_unwrapped` (MIC-unwrapped saddle position).
+- **Endpoints:** `r(0) = x_0` (drawn from an ice-cream-cone around the `r_R → r_S` axis, see below), `r(1) = r_saddle_unwrapped`.
 - **Path:** straight-line Optimal Transport, `r(t) = (1−t) · r(0) + t · r(1)`, wrapped back into the unit cell before each UMA forward pass.
 - **Target velocity:** `v_target = r(1) − r(0)`, constant in `t` for each training sample.
 
@@ -108,103 +110,79 @@ r_saddle_unwrapped = r_reactant + Δ
 
 `r_saddle_unwrapped` may lie outside the unit cell; that's fine. Interpolation is done in unwrapped space. Positions are wrapped back into the cell only immediately before being passed to UMA (for clean neighbor-list generation and canonical coordinates).
 
-### Perturbation geometry — Gaussian on mobile atoms
+### Sampling region — ice-cream-cone
 
-Perturbations `ε_rs_pert` (reactant-state, used by obj (2) and inference) and `ε_ts_pert` (TS-state, used by optional obj (1)) are drawn from an isotropic Gaussian **only over mobile (non-frozen) atoms**. Frozen atoms receive zero perturbation. This choice is deliberate:
+**Training uses a single objective**: draw `x_0` from a 3D ice-cream-cone around the `r_R → r_S` axis, then flow straight to `r_S`. The cone is the **union of balls** `B(c, R(c))` for `c` on the segment `[r_R, r_S]`, where
 
-- **Sparsity matches physics.** Real TS displacement vectors are sparse — a few atoms participate in the bond-forming / breaking event, most atoms barely move. Gaussian's per-atom magnitude distribution (χ₃ tail) naturally produces "one-atom-moves-a-lot" samples, which a fixed-norm shell cannot — a shell concentrates per-atom magnitude tightly around `R/√M` and suppresses single-atom-dominant perturbations.
-- **Same distribution at training and inference** — no train/inference asymmetry.
-
-**Sampling:**
 ```
-ε_rs_pert_raw       ~ N(0, σ_rs_pert² · I_{3M})     # reactant-state perturbation, 3 components per mobile atom
-ε_rs_pert[mobile]    = ε_rs_pert_raw.reshape(M, 3)
-ε_rs_pert[frozen]    = 0
+R(c) = R_TS · |c − r_R| / |Δ|,    R_TS = min(alpha · |Δ|, R_max_abs)
 ```
 
-- `σ_rs_pert` in Å (absolute, not dataset-relative). Primary hyperparameter. Rule-of-thumb default: `σ_rs_pert ≈ 0.05 · ⟨‖Δ‖⟩ / √(3M)`, where `⟨‖Δ‖⟩` is the dataset-mean displacement norm (computed at LMDB conversion time).
-- An analogous TS-state perturbation `ε_ts_pert` with std `σ_ts_pert` is used by objective (1) (TS-denoising) with identical structure — Gaussian on mobile atoms, zero on frozen.
-- `GlobalAttn` + multiple distant-atom supervision handles the "two atoms moving simultaneously" case that pure-local perturbation alone cannot.
+The resulting 3D region is shaped like an ice-cream cone:
 
-**Notation note.** The symbol `ε` is used in two different senses throughout this document and in the algorithms below:
-- **`ε` (no subscript)** — scalar flow-time cutoff for objective (3), dimensionless, ∈ (0, 1).
-- **`ε_rs_pert`, `ε_ts_pert` (subscripted)** — spatial perturbation vectors in Å, `(N, 3)` tensors. Always subscripted when referring to perturbation.
+- **apex at `r_R`** (ball of radius 0 — a single point),
+- **full 3D ball of radius `R_TS` at `r_S`** — all points within `R_TS` of the saddle in any direction are valid `x_0`,
+- **smooth cone surface** on the sides, tangent to the ball at a circle located at axial position `|Δ| − R_TS²/|Δ|` (NOT at `r_S`),
+- **half-angle `arcsin(R_TS/|Δ|)`** on the lateral surface.
 
-**Mode selection at inference** (the central research bet, H2) still holds: different random Gaussian draws at `t = 0` produce different input positions, which the trained velocity field routes to different saddles via local environments and global attention.
+The key property: **the region has finite support entirely inside one angular wedge** around `r_R`. Isotropic-Gaussian sampling (our earlier approach) has tails that leak into neighbouring wedges; under UMA's SO(3) equivariance, those out-of-wedge samples create training targets that CANNOT be simultaneously satisfied by any equivariant model, and SGD therefore collapses the learned field to the symmetry-averaged "radial outward" compromise instead of a per-saddle flower. The ice-cream-cone has **zero out-of-wedge mass by construction**, so that pathology never triggers.
 
-### Training objectives
+**Hyperparameters:**
 
-Three objectives, selected per-sample by weighted draw. Weights `(w_1, w_2, w_3)` default to `(0, 1, 2)` — obj (1) disabled initially; obj (3)'s clean-ray supervision gets double weight because its target signal is the cleanest.
+- `alpha` (default `0.5`) — cone lateral half-angle is `arcsin(alpha)`. `alpha=0.5` gives 30°, which fits inside a C_6v wedge exactly.
+- `R_max_abs` (default `1.0 Å`) — absolute cap on `R_TS`. Prevents the cone from becoming so large on reactions with big `|Δ|` that it overlaps neighbouring saddles.
 
-**Objective (3) — Clean reactant → TS ray [anchor, high weight].** Pure straight-line flow from `r_reactant` to `r_saddle_unwrapped`, with target velocity `Δ`. Time sampled from `Uniform(ε, 1)` — the `t > ε` cutoff is essential because at `t = 0` all rays to different saddles of the same reactant share the same input `r_reactant`, causing mode-averaging of targets. For `t > ε`, the intermediate position `(1-t) · r_R + t · r_S_un` differs between rays and the targets are unambiguous. This provides the highest-quality, noise-free supervision on the physically meaningful paths.
+Both defaults were validated on LiC (|Δ| ≈ 1.24 Å) and produce the "flower" field with no drift. See `saddlegen/flow/matching.py::sample_icecream_cone` for the rejection-sampling implementation.
 
-**Objective (2) — (reactant + Gaussian) → TS [multimodality breaker].** Gaussian perturbation `ε_rs_pert ~ N(0, σ_rs_pert² · I_{3M})` on mobile atoms. Straight-line flow from `r_reactant + ε_rs_pert` to `r_saddle_unwrapped`, target velocity `Δ − ε_rs_pert`, `t ~ Uniform(0, 1)`. Provides training coverage at the perturbed start points where inference begins, and the implicit-latent-via-perturbation mechanism that routes different initial conditions to different saddles.
+### How the cone relates to the previously-failed multi-objective scheme
 
-**Objective (1) — TS + Gaussian → TS [optional regularizer].** Gaussian noise `ε_ts_pert ~ N(0, σ_ts_pert² · I_{3M})` on mobile atoms. Straight-line flow from `r_saddle_unwrapped + ε_ts_pert` back to `r_saddle_unwrapped`. Teaches the network to denoise toward a saddle from nearby points — a Dimer-like contraction behavior around each saddle. Default weight 0; enable for ablation.
+A degenerate case `R_TS → 0` collapses the cone to the line segment `[r_R, r_S]` — which is identical in spirit to the old "objective 3" (clean reactant → saddle ray). A very large `R_TS` approaches isotropic sampling near `r_S` — related to the old "objective 1" (TS denoising). So the cone is a **single parameterised family** that spans what used to be three separate objectives, selects the right density trade-off with one knob, and avoids all the out-of-wedge pathologies of the old Gaussian-based obj 2.
 
-**On H3 (objective-overlap conflicts)** — substantially mitigated under this scheme. Obj (3) samples points on the clean ray `x_t^(3) = (1-t)r_R + t·r_S_un`; obj (2) samples points `x_t^(2) = (1-t)(r_R + ε_rs_pert) + t·r_S_un` with Gaussian `ε_rs_pert`. Their training loci coincide only when `ε_rs_pert = 0`, a measure-zero event. For interior values of `ε_rs_pert`, obj (2) supervises different `(x_t, t)` than obj (3), so there is no direct gradient conflict. See the updated H3 in the risks section.
+### Mode selection at inference
+
+Different random draws of a small Gaussian perturbation `ε_inf` around `r_R` at `t = 0` produce different initial Li positions, which land in different angular wedges of the reactant's local environment. The trained velocity field routes each into its own wedge's saddle via local-environment features and UMA's equivariance. `σ_inf` is the only inference-time knob; it is decoupled from training (`alpha`, `R_max_abs`). On LiC a value of `σ_inf = 0.15 Å` gives reliable coverage across all 63 test reactants.
 
 ### Training algorithm
 
 ```
-HYPERPARAMETERS
-    σ_rs_pert       Gaussian std for obj (2) reactant-state perturbation, in Å  (primary HP)
-    σ_ts_pert       Gaussian std for obj (1) TS-state perturbation,       in Å  (typically ≈ σ_rs_pert)
-    ε               flow-time cutoff for obj (3) clean-ray sampling, dimensionless ∈ (0, 1)
-    w_1, w_2, w_3   loss weights (defaults: 0, 1, 2)
-
-# Notation reminder: ε (unsubscripted) = flow-time cutoff;
-# ε_rs_pert, ε_ts_pert (subscripted) = spatial perturbation vectors.
-# Always distinguished by subscript.
+HYPERPARAMETERS (sampling shape only — no objective weights)
+    alpha       cone half-angle = arcsin(alpha)             (default 0.5 → 30°)
+    R_max_abs   absolute cap on the ball radius at r_S      (default 1.0 Å)
 
 PER TRAINING SAMPLE
-    Load triplet from LMDB:
+    Load triplet:
         r_R, r_S_un, r_P_un, Z, cell, fixed, task_name, charge, spin
-    # r_S_un = r_R + MIC(r_saddle_raw − r_R), precomputed at LMDB conversion time
-    Δ       = r_S_un − r_R                    # precomputed MIC displacement
-    mobile  = (fixed == False); M = mobile.sum()
+    # r_S_un = r_R + MIC(r_saddle_raw − r_R)
+    Δ       = r_S_un − r_R
+    mobile  = (fixed == False)
+    R_TS    = min(alpha · |Δ|,  R_max_abs)
 
-    Draw k ~ Categorical(w_1, w_2, w_3)
+    # Draw x_0 uniformly from the ice-cream-cone.
+    # Rejection sample on a bounding cylinder of radius R_TS, axial range [0, |Δ| + R_TS]:
+    #   1. sample a ∈ U(0, |Δ| + R_TS);  r ∈ R_TS · √U(0,1);  θ ∈ U(0, 2π)
+    #   2. ACCEPT if
+    #        a ≤ L_cone = |Δ| − R_TS²/|Δ|  AND  r² · (|Δ|² − R_TS²) < a² · R_TS²   # inside cone
+    #        OR
+    #        a > L_cone  AND  (a − |Δ|)² + r² < R_TS²                              # inside ball at r_S
+    # Assemble x_0 on the mobile atom (single-mobile-atom case only for now):
+    x_0[frozen] = r_saddle_un[frozen]                         # frozen atoms unperturbed
+    x_0[mobile] = r_R[mobile] + a·axis + r·(cos θ·e1 + sin θ·e2)
 
-    # Every objective is a straight-line OT flow between two endpoints defined in
-    # UNWRAPPED space. v_target = x_1 − x_0 universally for straight-line OT.
-    # Wrap is applied only at the final x_t step, immediately before the UMA forward.
+    t        ~ Uniform(0, 1)
+    v_target = r_S_un − x_0                                    # constant in t for straight-line OT
+    x_t      = wrap((1 − t) · x_0 + t · r_S_un)                # interpolate in unwrapped, wrap for UMA
 
-    if k == 3:                                # clean reactant → TS ray
-        x_0 = r_R                             # unwrapped endpoint at flow-time 0
-        x_1 = r_S_un                          # unwrapped endpoint at flow-time 1
-        t   ~ Uniform(ε, 1)
-
-    if k == 2:                                # (reactant + Gaussian) → TS
-        ε_rs_pert_raw     ~ N(0, σ_rs_pert² · I_{3M})
-        ε_rs_pert         = zeros(N, 3)
-        ε_rs_pert[mobile] = ε_rs_pert_raw.reshape(M, 3)
-        x_0 = r_R + ε_rs_pert                 # unwrapped
-        x_1 = r_S_un                          # unwrapped
-        t   ~ Uniform(0, 1)
-
-    if k == 1:                                # TS + Gaussian → TS (optional)
-        ε_ts_pert_raw     ~ N(0, σ_ts_pert² · I_{3M})
-        ε_ts_pert         = zeros(N, 3)
-        ε_ts_pert[mobile] = ε_ts_pert_raw.reshape(M, 3)
-        x_0 = r_S_un + ε_ts_pert              # unwrapped
-        x_1 = r_S_un                          # unwrapped
-        t   ~ Uniform(0, 1)
-
-    v_target = x_1 − x_0                      # constant in t for straight-line OT
-    x_t      = wrap((1 − t) · x_0 + t · x_1)  # interpolate in unwrapped space, then wrap for UMA
-
-    # Shared forward pass (objective-agnostic)
+    # Shared forward pass
     atoms        = Atoms(positions=x_t, numbers=Z, cell=cell, pbc=True)
     data         = AtomicData.from_ase(atoms, task_name=task_name)
-    data.charge  = charge; data.spin = spin                                 # required inputs to UMA's csd_embedding
-    local_feat   = UMA_backbone(data)["node_embedding"]                     # (N, (lmax+1)², sphere_channels) = (N, 9, 128) for UMA-S-1.2
-    global_feat  = GlobalAttn(local_feat)                                   # globally-aware equivariant per-atom irreps
-    v_pred       = VelocityHead(global_feat, sinusoidal_time_embed(t))      # (N, 3)
-    v_pred[fixed]   = 0                                                     # hard mask frozen atoms
-    if fixed.sum() == 0:                                                    # ONLY if the system is fully mobile
-        v_pred[mobile] -= v_pred[mobile].mean(dim=0, keepdim=True)          # CoM projection — otherwise frozen atoms pin the cell
-    # See §"Output projections" for why this is conditional and not unconditional.
+    data.charge  = charge; data.spin = spin
+    local_feat   = UMA_backbone(data)["node_embedding"]        # (N, 9, 128) for UMA-S-1.2
+    global_feat  = GlobalAttn(local_feat)
+    v_pred       = VelocityHead(global_feat, sinusoidal_time_embed(t))   # (N, 3)
+    v_pred[fixed] = 0                                          # hard mask frozen atoms
+    if fixed.sum() == 0:
+        v_pred[mobile] -= v_pred[mobile].mean(dim=0, keepdim=True)
+    # See §"Output projections" for why CoM projection is conditional.
 
     loss_sample = mean_squared_error(v_pred, v_target)
 
@@ -214,14 +192,15 @@ PER TRAINING SAMPLE
 ### Inference / sampling algorithm
 
 ```
-GIVEN: r_R, Z, cell, fixed, task_name, charge, spin, n_perturbations, K (integration steps)
+GIVEN: r_R, Z, cell, fixed, task_name, charge, spin, n_perturbations, K, σ_inf
 
 For i in 1..n_perturbations:
-    ε_rs_pert_raw_i       ~ N(0, σ_rs_pert² · I_{3M})     # same distribution as obj (2) training
-    ε_rs_pert[mobile]      = ε_rs_pert_raw_i.reshape(M, 3)
-    ε_rs_pert[frozen]      = 0
-For each ε_rs_pert (batched in parallel):
-    x = wrap(r_R + ε_rs_pert)                             # wrap at start (r_R canonical, ε small)
+    ε_i               ~ N(0, σ_inf² · I_{3M})                  # inference-time Gaussian, mobile atoms only
+    ε_i[frozen]        = 0
+    x_i                = wrap(r_R + ε_i)                        # initial Li position
+
+For each ε_i (batched in parallel):
+    x = x_i
     for step in range(K):
         t            = step / K
         atoms        = Atoms(positions=x, numbers=Z, cell=cell, pbc=True)
@@ -231,17 +210,19 @@ For each ε_rs_pert (batched in parallel):
         global_feat  = GlobalAttn(local_feat)
         v            = VelocityHead(global_feat, sinusoidal_time_embed(t))
         v[fixed]     = 0
-        if fixed.sum() == 0:                              # CoM projection only if system is fully mobile
+        if fixed.sum() == 0:
             v[mobile] -= v[mobile].mean(dim=0, keepdim=True)
-        x            = wrap(x + (1/K) · v)                # wrap after each Euler step
+        x            = wrap(x + (1/K) · v)
     candidate_saddles.append(x)
 
 Cluster candidates by pairwise RMSD under PBC (agglomerative, cutoff ≈ 0.1 Å).
-Take cluster centroids as final candidate TSs.
+Take cluster medoids as final candidate TSs.
 Optional: Dimer-refine each centroid using fairchem's ASE Calculator (UMA potential).
 ```
 
 **Default integrator:** forward Euler with `K = 50`. User-configurable. Swap in `torchdiffeq` RK45 later if needed — one-line change in the sampler.
+
+**Default `σ_inf = 0.15 Å`** — the same value verified on LiC. Smaller `σ_inf` means tighter starting cloud around `r_R`, which gives less initial spread; larger `σ_inf` starts Li further from the apex and risks landing outside the trained region. 0.15 is a good default for saddles ~1 Å from the reactant; scale proportionally for much larger `|Δ|`.
 
 ## Training data
 
@@ -282,7 +263,7 @@ Both backends expose the same per-sample dict so `matching.py`, `sampler.py`, an
 
 **R→S and P→S doubling.** By microscopic reversibility, both `(start=R, saddle=S)` and `(start=P, saddle=S)` are valid training pairs for the same saddle. `triplet_to_pair_records` emits both; MIC-unwrap is recomputed for each because the periodic-image choice depends on the anchor. Effective dataset size is `2 × num_triplets`.
 
-**Dataset-level `⟨‖Δ‖⟩`** is computed at conversion time (Backend B, written to `<db_path>.stats.json`) or at first-access time (Backend A, cached via `stats_cache`). This scalar sets the default `σ_rs_pert` per the rule-of-thumb in §Perturbation geometry.
+**Dataset-level `⟨‖Δ‖⟩`** is computed at conversion time (Backend B, written to `<db_path>.stats.json`) or at first-access time (Backend A, cached via `stats_cache`). Used by obj 2 (reactant Gaussian, optional) to pick a default `σ_rs_pert ≈ 0.05 · ⟨‖Δ‖⟩ / √(3M)` when `--w2 > 0`.
 
 **No precomputed neighbor lists.** Graphs are rebuilt on the fly by `AtomicData.from_ase` at every forward pass — required anyway because `r(t)` changes with flow time and the graph can genuinely change (bond-breaking reactions cross UMA's cutoff radius). Neighbor-list cost is ~1–10 ms CPU per system and is dominated by the UMA forward pass.
 
@@ -325,11 +306,53 @@ Fully 2D-visualizable, interpretable by eye, small enough to iterate quickly.
 **Plain PyTorch + HuggingFace `accelerate`**, matching the GenFlows pattern. No Hydra, no Lightning, no TorchTNT.
 
 - **Optimizer:** AdamW. `lr = 1e-3` (head-only, frozen backbone) or `lr = 1e-5` (end-to-end fine-tuning with UMA unfrozen). Cosine LR schedule, gradient clip `max_norm = 1.0`.
-- **EMA:** decay `0.9999` on all trainable parameters.
+- **EMA:** decay scales with total training steps — see the EMA-tuning rule below. Default `0.9999` is calibrated for the 30M-triplet production run (≥ 500k steps). For small-scale debug / example runs (a few thousand steps), `0.9999` leaves the shadow frozen at initialization and has to be lowered.
 - **Precision:** bf16 forward + fp32 optimizer state, to match UMA's training precision. Exact match to fairchem's config verified in first coding session.
 - **Multi-node:** `accelerate launch --multi_gpu --num_machines=N ...` under SLURM. `accelerate` handles DDP, FSDP (if UMA + optimizer state doesn't fit per-GPU), gradient accumulation.
 - **Checkpointing:** `accelerator.save_state()` / `load_state()`; FSDP-sharded under the hood for multi-node.
 - **Gradient checkpointing:** `torch.utils.checkpoint` on the UMA backbone layers when fine-tuning; transparent to `accelerate`.
+
+### EMA tuning — critical, scales with run length
+
+The EMA update is `shadow[k+1] = d · shadow[k] + (1 − d) · θ[k+1]`. Unrolling over `K` optimizer steps gives
+
+```
+shadow[K] = d^K · θ[init] + (1 − d) · Σ d^(K−k) · θ[k]
+           └── init leakage ┘  └── weighted avg of trajectory ┘
+```
+
+Two numbers govern whether the shadow is useful:
+
+1. **Init leakage `d^K`.** Share of the shadow that is still the random initialization. Must be negligible (`< 1%`) for the shadow to reflect the trained model at all.
+2. **Effective averaging window `τ = 1/(1 − d)`.** Number of recent steps the shadow is a weighted average over. Should be roughly `K_total / 50` — long enough to suppress optimization noise, short enough to track progress.
+
+Concrete numbers for `d = 0.9999`:
+
+| total steps `K` | init leakage `d^K` | window / total |
+|---|---|---|
+| 1,000 (Li/C @ 200 ep) | **0.90** | 10 × K |
+| 3,000 (Li/C @ 500 ep) | **0.74** | 3.3 × K |
+| 10,000 | 0.37 | 1.0 × K |
+| 50,000 | 0.007 | 0.2 × K |
+| 500,000 | 5×10⁻²³ | 0.02 × K |
+| 1,000,000 (planned 30M run) | ~0 | 0.01 × K |
+
+For the **30M-triplet run** (60M samples at R↔S doubling, global batch ≥ 128, so ≥ 470k steps per epoch and easily 1M+ steps over the full schedule), `d = 0.9999` gives init leakage ≈ 0 and window ≈ 1–2% of total — exactly what you want. **Keep the default.**
+
+For any **small-scale debug / example run** (Li/C is the canonical case, 1–3k steps), `d = 0.9999` leaves the shadow essentially at init. Pick `d` from the rule:
+
+```
+d  =  1 − 1 / window,          where  window ≈ K_total / 50
+```
+
+| `K_total` steps | recommended window | recommended `d` |
+|---|---|---|
+| 1–5k | 50–100 | **0.98–0.99** |
+| 5–50k | 100–1,000 | 0.99–0.999 |
+| 50–500k | 1,000–10,000 | 0.999–0.9999 |
+| ≥ 500k (30M production) | ≥ 10,000 | **0.9999** |
+
+Li/C example runs use `--ema-decay 0.99`. `examples/LiC/evaluate.py` also supports `--no-ema` which bypasses the shadow and reads raw point-estimate weights from `model.safetensors`; useful as a diagnostic if you suspect EMA is the problem (symptoms: ~0% recall, one cluster per site collapsed on top of the reactant, `|v_pred| ≈ 0.1 Å` when target is ~1 Å — all from evaluating the initialization).
 
 ### Why not fairchem's full training stack (TorchTNT + Hydra + Ray)
 
@@ -358,15 +381,16 @@ For the methods-section writeup. Each hypothesis has an explicit falsification t
 
 - **H1 — Local-environment transfer.** The GNN over UMA features generalizes TS knowledge across reactants with similar local chemistry. *Falsification:* leave-one-reactant-out on the Li/C test case should recover held-out TSs at RMSD below threshold. *Risk:* similar local environments in training data point to very different TSs.
 
-- **H2 — Implicit latent via Gaussian perturbation.** Random Gaussian `ε_rs_pert` on mobile atoms selects different saddle modes without explicit conditioning. The hypothesis is that UMA's pretrained features encode Hessian-like soft-mode structure (they were trained on DFT forces), `GlobalAttn` allows distant atoms to coordinate which site reacts, and `VelocityHead` amplifies whichever mode has the largest projection in `ε_rs_pert` — effectively a learned Dimer. *Falsification:* saddle diversity at inference should scale with `σ_rs_pert` and `n_perturbations`. *Risk:* UMA features do not encode soft-mode structure, perturbations mode-average, the model returns one "mean" saddle per reactant.
+- **H2 — Implicit latent via inference-time perturbation.** Random Gaussian `ε_inf` at t=0 selects different saddle modes without explicit conditioning. UMA's pretrained features encode Hessian-like soft-mode structure (they were trained on DFT forces); `GlobalAttn` + the trained velocity field route each perturbation into the wedge whose saddle it's angularly closest to. *Falsification:* saddle diversity at inference should scale with `σ_inf` and `n_perturbations`. **Confirmed on LiC** (fix 24, fix 25): 45/48 hits distributed across all 6 C_6-orbit saddles.
 
-- **H3 — Three-objective coexistence.** Objectives (1), (2), and (3) supervise disjoint regions of `(x_t, t)` space with probability 1 (their loci coincide only on measure-zero sets), so joint training does not produce gradient conflicts. *Falsification:* per-objective training losses should decrease independently; training is stable with weights `(0, 1, 2)`. *Risk:* in rare high-overlap cases (very small `σ_rs_pert` making obj (2) land near the clean ray), minor blur in velocities near the ray — fix by increasing `σ_rs_pert` or decreasing obj (2)'s weight.
+- **H3 — Finite-support sampling prevents mode averaging.** An ice-cream-cone shape (obj 1) has zero mass outside one wedge around r_R. Isotropic-Gaussian sampling (old obj 2) has tails that leak into neighbouring wedges; under SO(3) equivariance, those out-of-wedge samples impose training targets the equivariant model cannot simultaneously satisfy, so SGD collapses the field to the C_6v-averaged radial compromise. *Falsification:* isotropic-Gaussian obj 2 with large σ should drift after early-curving; ice-cream-cone obj 1 should not. **Confirmed on LiC_simpler**: fix 13 (Gaussian σ=0.5) drifted 42→0 by ep 8000; fix 24 (cone, same scale) plateaued at 45/48.
 
 - **H4 — Frozen vs. fine-tuned UMA.** Frozen UMA gives an acceptable baseline; fine-tuning improves further. *Risk:* fine-tuning destabilizes UMA's pretrained features; may need very low LR, warmup, or LoRA-style adapters.
 
-- **H5 — Gaussian perturbation geometry.** Isotropic Gaussian on mobile atoms produces the sparse per-atom magnitude distribution that matches real TS displacements (few atoms move a lot, most barely). *Falsification:* on the Li/C test with two distant Li, Gaussian samples should regularly produce one-Li-dominant perturbations. *Risk:* for very large `M`, even Gaussian may under-represent the sparsest real TS directions; mitigation via sparse-Gaussian or Hessian-aware inference sampling reserved as future work.
+- **H5 — Sampling-region shape determines which field is learnable.** Even within finite-support regions, the exact shape of `x_0`'s distribution matters. Ice-cream-cone with `R_TS = α·|Δ|` and `α ≈ 0.5` (30° half-angle) was the shape that gave a clean flower on LiC; too-tight (R_TS small, fix 21/27/28) leaves the field near r_R undertrained and trajectories run out of velocity before reaching saddles. *Falsification:* sweep `α`; quality should trace out the min-α cliff where training-sample density at r_R drops. **Partially confirmed on LiC/LiC_simpler**; systematic α sweep deferred to 30M run.
 
-- **H7 — Global attention resolves distant-site ambiguity.** `GlobalAttn` allows atoms separated by more than UMA's cutoff to exchange information, so the network does not predict simultaneous reactions at spatially-independent sites. *Falsification:* on the Li/C test with two distant Li adatoms, the model should predict single-Li-hop saddles (not simultaneous-hop artifacts). *Risk:* `O(N²)` attention cost grows for large unit cells; distance-sparse attention (attend only within 2× UMA cutoff) reserved as an optimization.
+- **H7 — Global attention resolves distant-site ambiguity.** `GlobalAttn` allows atoms separated by more than UMA's cutoff to exchange information, so the network does not predict simultaneous reactions at spatially-independent sites. *Falsification:* on the Li/C test with two distant Li adatoms, the model should predict single-Li-hop saddles (not simultaneous-hop artifacts). **Partially falsified 2026-04-21:** for Li/C, UMA's 4-hop MP already gives ~24 Å receptive field (larger than the cell); empirical probe shows GlobalAttn attention is near-uniform over all 126 C atoms and barely depends on Li position. GlobalAttn is not doing useful work on this test case. It may still matter on the larger 30M-run systems when cell dimensions approach or exceed 24 Å; defer to a per-system check there.
+
 
 ## Planned layout (subject to refinement during implementation)
 
@@ -406,13 +430,6 @@ Package import name: `saddlegen` (lowercase, per PEP 8); the project is referred
 
 Kept locally during design; **not tracked by git**. Will be removed before public release, along with this section.
 
-| Directory | What it is | Role for SaddleGen |
-|---|---|---|
-| `fairchem/` (+ `fairchem-papers/`) | Meta FAIR's chemistry framework — UMA MLIP, eSCN-MD backbones, OMat25 data | **Architectural anchor.** Hard dependency. Provides UMA backbone, `AtomicData`, PBC-aware graph builder, ASE Calculator integration. |
-| `mattergen/` (+ paper) | Microsoft's diffusion model for inorganic crystal generation with property conditioning | Methodology reference for conditional generation on periodic systems. |
-| `flowmm/` (+ paper) | Riemannian flow matching on the crystal manifold (atom types + lattice) | Methodology reference; SaddleGen uses standard Euclidean flow matching because cell and atom identities are fixed (flat `ℝ^(3N)` displacement space). |
-| `all-atom-diffusion-transformer/` (+ paper) | FAIR's ADiT — latent diffusion (Equiformer autoencoder + DiT) unified for molecules + materials | Methodology reference for decoupling representation learning from generation. **Not planned for deep read** — only relevant if we later explore latent-space flow matching as a follow-up to the Cartesian version. |
-
 ## Hardware target
 
 NERSC Perlmutter, 4 × A100 per node. **Multi-node from day one** for the 30M-triplet run. The Li/C test case is a single-GPU (or single-node) job.
@@ -421,143 +438,70 @@ NERSC Perlmutter, 4 × A100 per node. **Multi-node from day one** for the 30M-tr
 
 TBD — likely MIT (matching GenFlows). fairchem is MIT.
 
-## Next coding session — immediate tasks
+## Latent-bug log — pitfalls already caught; re-check if behaviour looks wrong
 
-The design is converged. The next working session should execute the following in order. CLAUDE.md (this file) is the authoritative spec; do not re-relitigate design decisions unless the user explicitly asks.
-
-### Session handoff — status at last checkpoint
-
-**Phase 1 and Phase 2 (steps 1–14) are complete.** All source code lives in `saddlegen/` and is syntax-clean; behavioural smoke tests pass on real Li/C data with a mock UMA backbone (gradients flow, sampler output respects frozen atoms, eval loop computes sensible recall/precision). CLAUDE.md below marks each step with ~~strikethrough~~ + "Done." notes as it was completed.
-
-**What did not run at last checkpoint (environment-limited, not code-limited):**
-- `accelerate` was not installed in the working Python env, so `train()`'s integration with `accelerator.prepare` / DDP / save-state was not exercised end-to-end. The non-`accelerate` pieces (`EMA`, LR schedule, `identity_collate`, config defaults) are verified; `train()` itself is standard `accelerate` API (~60 LOC of loop plumbing).
-- UMA-S-1.2 was not loaded (needs `fairchem` + HuggingFace cache). `load_uma_backbone` symbol path (`predict_unit.model.module.backbone`) was verified against vendored `fairchem 2.19` source.
-- bf16 autocast on GPU was not exercised (all tests ran fp32/CPU).
-
-**To resume on a new machine:** (1) `pip install -e .` in the project root — brings in `fairchem-core`, `accelerate`, `ase`, `torch~=2.8`, etc. per `pyproject.toml`. (2) Ensure the UMA-S-1.2 checkpoint is reachable (HF token or pre-cached). (3) Run `python examples/LiC/train.py` — it's argparse-only, defaults are reasonable for the Li/C size. (4) Once trained, `python examples/LiC/evaluate.py` reports ALL / NOVEL / SHARED recall. Start with `--limit-reactants 3` and fewer epochs for a first smoke run.
-
-**Latent-bug log — pitfalls already caught once, re-check if behaviour looks wrong:**
+- **UMA production dropouts leak into training** (fixed 2026-04-21). `uma-s-1p2` has `composition_dropout=0.10` and `mole_dropout=Dropout(p=0.05)` by default; PyTorch's recursive `.train()` activates them on the frozen backbone, creating stochastic training features vs deterministic inference features. `FlowMatchingLoss.train()` overrides `super().train()` to re-call `self.backbone.eval()`. Symptom if broken: training-loss floor that won't drop below noise, large-ish |v_pred| mismatch between training-time probe and inference-time probe.
+- **Sinusoidal time-embedding base wrong for t ∈ [0,1]** (fixed 2026-04-21). The stock base-10000 formula from Transformer positional encodings put `sin(freq·t)` at ~0 on 31 of 32 dimensions for flow-time in [0,1]. `velocity_head.sinusoidal_time_embedding` now uses geometric frequencies from 1 to `half` cycles per unit flow-time. Symptom if broken: time FiLM learns near-zero scale; velocity field almost time-invariant; the stated `time_embed_dim=64` is effectively ~4 useful dims.
+- **Evaluation RMSD over *all* atoms dilutes mobile-atom error by √N** (fixed 2026-04-20). `saddlegen.utils.eval.rmsd_pbc` / `pairwise_rmsd_pbc` / `cluster_by_rmsd` / `hungarian_match` / `evaluate_predictions` all take an optional `mobile_mask=None`. For Li/C (126 frozen C + 1 mobile Li) a 0.10 Å threshold without the mask matches anything within 1.13 Å of truth — worthless.
 - **Silent CoM-projection bug** (fixed). Any system with 1 mobile atom and unconditional `v[mobile] -= v[mobile].mean()` gets its only mobile-atom velocity zeroed — no gradient, no learning, loss constant. Current code conditionals on `fixed.sum() == 0` per system; see §"Output projections".
 - **AdaLN-zero step-0 gradient unlock** (not a bug, but surprising). `VelocityHead.time_mlp`'s last layer is zero-initialised; grad on the *first* MLP layer is exactly 0 at step 0 (no path through a zero-weighted matrix). Last layer updates on step 0, which unlocks earlier layers from step 1. If you see `|∇time_mlp[0]|` = 0 only on step 0 that is expected; if it stays zero past step 1 something else is broken.
-- **LiC atom index 126 is the Li**, atoms 0–125 are the frozen C sheet. It's easy to assume atom 0 is the mobile one and get nonsense diagnostics.
+- **LiC atom index 126 is the Li**, atoms 0–125 are the frozen C sheet. For `LiC_simpler` the Li is at index 112 (112 C atoms in the pristine cell). Easy to assume atom 0 is the mobile one and get nonsense diagnostics.
 - **Site grouping must be R∪P**, not R-only. R-only undercounts saddles per site by ~2× and looks like the data is worse than it is.
 - **UMA layout `(N, (lmax+1)², C)` vs e3nn `(N, Irreps.dim)`** are not interchangeable; all SaddleGen modules use UMA's `SO3_Linear` to avoid layout-conversion plumbing. If you add e3nn ops, you need conversion helpers.
 - **Negative z-component in the Li/C cell** (`-15 Å`) is intentional (vacuum direction, left-handed cell). MIC math and fairchem neighbor-list handle it; do not "fix" the sign.
+- **Isotropic Gaussian obj 2 with large σ drifts the field to radial outward** (diagnosed 2026-04-22, fixed via ice-cream-cone). Any Gaussian perturbation whose tail crosses into a neighbouring wedge creates equivariance-linked training targets that no SO(3)-equivariant model can simultaneously satisfy; SGD collapses to the C_6v-averaged radial compromise, losing the multi-attractor "flower". Ice-cream-cone sampling has finite support inside one wedge by construction and eliminates the pathology. See §"Flow formulation" for the construction; fix 13/17/19/21/22/24 history is summarised in the user-facing README.
 
-### Phase 1 — fairchem deep read (no code yet, just pinning unknowns)
+## What was tried and what worked (condensed)
 
-1. **Read `other_codes/fairchem/src/fairchem/core/models/` to locate `Linear_Force_Head`.** Record its exact architecture: MLP depth, width, activation, how it projects `l=1` irreps to `(N, 3)`. Our `VelocityHead` mirrors this, plus a sinusoidal time-embedding MLP whose output is added as a scalar bias on the invariant (`l=0`) channels only. Confirm equivariance preservation.
-2. **Read `fairchem.core.pretrained_mlip.get_predict_unit`.** Understand exactly how UMA checkpoints are loaded, what object they return, and how to split backbone vs. head so we can swap ours in.
-3. ~~**Read the `uma-s-1p2` config / model card.**~~ **Done in the prior session.** Pinned facts: bf16 training; cutoff 6.0 Å, max_neighbors=30 (non-strict); `task_name` set is `{omat, oc20, oc22, oc25, omol, odac, omc}` (oc22 confirmed present); no hard model-side atom-count cap (`max_atoms=700` is a sampler constraint in fairchem's training config only); 6.6M active / 290M total params; backbone is `K4L2` → output `(N, 9, 128)`; force normalization (`rmsd=1.423`) lives in UMA's heads, which we discard, so it does not apply to us — our own velocity scaling uses `delta_norm` from the LMDB stats.
-4. **Read `AtomicData.from_ase` and `core/graph/` neighbor builder.** Confirm PBC handling and the exact field list required for a forward pass.
-5. **Read `fairchem-core/pyproject.toml` to lock our dependency versions.** Produce `SaddleGen/pyproject.toml` with `fairchem-core` pinned to a specific version plus `ase`, `accelerate`, `lmdb`, `torch` matching fairchem's pins.
+~24 experiments on LiC_simpler and LiC; collapsed recipe: **obj 1 (ice-cream-cone) with default α=0.5, R_max=1.0**, 10000 epochs, LR=1e-3, EMA=0.99, Adam. All other knobs are vestigial.
 
-### Phase 2 — Li/C implementation (first real code)
+Major dead-ends, so future-you doesn't re-litigate:
+- **Isotropic Gaussian σ_ts perturbation (fix 13, 15, 20, 21, 22)** — always drifts from early curving peak to radial outward collapse. Loss still goes *down* during the drift because the radial compromise is genuinely lower MSE under C_6v equivariance + Gaussian out-of-wedge tails.
+- **σ_ts anneal (fix 18, large → small)** — accelerates the drift; shrinking targets pull |v| down everywhere.
+- **Wedge-clip on Gaussian (fix 17 perp-only, fix 19 angle-based)** — fix 19 works (45/48 stable) but needs explicit wedge geometry. Ice-cream-cone (fix 23/24/25) achieves the same result from just `(r_R, r_S, R_TS)` — no wedge knowledge needed, generalises to unknown symmetries. Cone is therefore the library default.
+- **Tensor-product head (fix 12, 14)** and **non-equivariant head (fix 7)** — head capacity was never the bottleneck; obj 1's sampling distribution was. Deleted from the repo.
+- **(1−|x|/a)^n distributions with n∈{2,4} (fix 22)** — even 0.17% out-of-wedge tail is enough to drift over 10k epochs.
+- **Truncated distributions with `|eps| ≤ R` in 3D norm (fix 21, fix 28)** — does not guarantee in-wedge (you can still exit the wedge perpendicular to the axis for some (eps_∥, eps_⊥) combinations). Drifted.
 
-6. ~~Implement `saddlegen/data/convert_traj_to_lmdb.py`~~ **Done.** Implemented as the dual-backend data layer described in §"Data format":
-    - `saddlegen/data/core.py` — MIC unwrap, triplet validation, R→S / P→S doubling, sanitized metadata, `delta_norm` computation.
-    - `saddlegen/data/traj_dataset.py` — `TrajTripletDataset` (backend A, reads `.traj` directly; used for Li/C).
-    - `saddlegen/data/convert_to_db.py` — CLI that converts `.traj` triplets into ASE-DB (`.db` or `.aselmdb`); writes companion `*.stats.json` with `⟨‖Δ‖⟩`.
-    - `saddlegen/data/db_dataset.py` — `AseDbSaddleDataset` (backend B, reads ASE-DB; used for the 30M run).
-    - Both datasets yield the same sample dict. R→S and P→S are emitted as separate samples, so `len(dataset) == 2 × num_triplets`.
-7. ~~Implement `saddlegen/data/transforms.py`~~ **Done.** Two pure-torch utilities used inside the flow loop:
-    - `wrap_positions(positions, cell)` — fractional round-trip wrapping, autograd-safe and GPU-safe; called before every UMA forward and after every Euler step.
-    - `gaussian_perturbation(mobile_mask, sigma, generator=None)` — isotropic `N(0, σ² I_{3M})` draw on mobile atoms, zero on frozen; used by objectives (1), (2), and inference.
-    - MIC unwrap is not in this module — it lives in `core.py` and is applied once at conversion / `__getitem__` time, not inside the flow loop.
-8. ~~Implement `saddlegen/data/lmdb_dataset.py`~~ **Superseded by step 6.**
-9a. ~~Implement `saddlegen/models/global_attn.py`~~ **Done.** Invariant-weighted equivariant self-attention, ~95 lines. `Q, K` from `l=0` via `nn.Linear`; `V` and `W_out` via UMA's `SO3_Linear` (see note in §"Global attention" on the e3nn → `SO3_Linear` switch). Multi-head split across the channel dim. Batched-graph attention mask via `batch_idx`. `GlobalAttn(num_layers)` stacks residual `GlobalAttnLayer`s.
-9b. ~~Implement `saddlegen/models/velocity_head.py`~~ **Done.** `VelocityHead(sphere_channels, input_lmax=2, depth=1)`, ~140 lines. `depth=1` at init is numerically equivalent to `Linear_Force_Head` thanks to zero-initialised time FiLM. See §"Head" for the time-FiLM equivariance proof and the `UMAGate` hand-rolled nonlinearity. Verified in-tree: equivariance error < 5e-7 at init and after 20 Adam steps; time signal reaches the output post-training.
-10. ~~**Before writing `matching.py`:** read FlowMM ... Then implement `saddlegen/flow/matching.py`~~ **Done.** Read FlowMM's `model_pl.py` for training-loss tricks; adopted: uniform `t` sampling (no logit-normal), plain MSE (no time reweighting), per-atom averaging, value-based grad clip (to be applied in `training.py`). Skipped: their Riemannian manifold code, their dataset-level affine I/O normalisation (we have `delta_norm_mean` available if needed later).
-    - `saddlegen/flow/matching.py` (~180 lines) implements the **three** straight-line OT objectives (CLAUDE.md diverged from the original "two-objective" plan). Per-sample Monte-Carlo objective draw via `k ~ Categorical(w_1, w_2, w_3)` — unbiased estimator of the weight-mixed loss with 1/3 the compute, and with `w_1=0` by default the sampler skips obj (1) entirely.
-    - Exports: `FlowMatchingConfig`, `FlowMatchingLoss`, `sample_endpoints`, `build_atomic_data`, `apply_output_projections`. `FlowMatchingLoss` wraps `backbone + GlobalAttn + VelocityHead` and returns `{loss, per_obj_count, per_obj_loss, n_mobile}` for logging.
-    - Output projections applied inside the loss module: (i) `v[fixed] = 0`; (ii) per-system CoM subtraction on mobile atoms via `index_add_` (vectorised, no Python loop over systems).
-    - AtomicData construction per sample goes via ASE (`from_ase`), then fairchem's `data_list_collater` batches across samples. `otf_graph=True` rebuilds the neighbour list every forward, which is correct and necessary because `x_t` changes with flow time.
-    - **AdaLN-zero gradient quirk:** `VelocityHead.time_mlp`'s final layer is zero-initialised, so at step 0 the gradient is zero on the first MLP layer (no path through a zero-weighted matrix). The last layer updates on step 0, which unlocks earlier layers from step 1 onward. Verified: loss drops 22.3 → 15.7 over 4 Adam steps on a mock-backbone smoke test.
-11. ~~Implement `saddlegen/flow/sampler.py`~~ **Done.** `sample_saddles(reactant, backbone, global_attn, velocity_head, sigma_rs_pert, n_perturbations=32, K=50)`, ~130 lines, `@torch.no_grad()`. Batches all `n_perturbations` trajectories into one `AtomicData` per Euler step — cost is O(K × one-batched-UMA-forward), independent of perturbation count. Supports `return_trajectory=True` (yields `(K+1, n_perturbations, N, 3)`) and an explicit `torch.Generator` for reproducibility. Reuses `apply_output_projections` from `matching.py` so the inference-time output projections are byte-identical to training.
-    - Verified in-tree: frozen atoms exactly immobile throughout integration (`v[fixed]=0`); trajectories diverge under different perturbations (no mode collapse); same generator seed → bit-identical outputs.
-12. ~~Implement `saddlegen/utils/training.py`~~ **Done.** ~240 lines. Exports `TrainingConfig`, `EMA`, `identity_collate`, `train`.
-    - `accelerate` is **lazily imported inside `train()`** so `EMA` / `TrainingConfig` / `identity_collate` are usable in environments where `accelerate` isn't installed (unit tests, minimal inference envs).
-    - `TrainingConfig` defaults match CLAUDE.md: `ema_decay=0.9999`, `grad_clip_norm=1.0`, `mixed_precision="bf16"`, AdamW with `weight_decay=1e-5`. LR schedule is linear-warmup-then-cosine with a `min_lr_ratio` floor (default 0.01).
-    - `EMA` is hand-rolled (not `torch.optim.swa_utils.AveragedModel`) for clean integration with accelerate's parameter preparation. Supports `update()`, `swap_in()` / `swap_out()` around eval, and `state_dict()` / `load_state_dict()` for checkpointing.
-    - DataLoader uses `collate_fn=identity_collate` — a pass-through returning `list[dict]`, because samples have heterogeneous N and default collation would try to stack and fail.
-    - Checkpointing: `accelerator.save_state(dir)` per `save_every_epochs` epochs, plus `ema.pt` and `meta.json` (epoch, global_step) written alongside. `resume_from=<ckpt_dir>` restores all three.
-    - Validation: optional `val_dataset` + `val_every_epochs`; evaluation is done under EMA weights via `ema.swap_in()` / `swap_out()`.
-    - Multi-node: works via `accelerate launch --multi_gpu --num_machines=N examples/li_on_carbon/train.py …`.
-    - Verified in-tree (without accelerate): EMA update math, swap_in/out round-trip, state_dict round-trip, LR schedule (warmup → cosine → floor), identity_collate pass-through, config defaults.
-13. ~~**Before writing `eval.py`:** read MatterGen ... Then implement `saddlegen/utils/eval.py`~~ **Done.** Read MatterGen's evaluation code (`evaluation/utils/utils.py`, `evaluation/metrics/structure.py`, `evaluation/evaluate.py`). **Divergences from MatterGen's protocol (deliberate)**:
-    - Their RMSD uses pymatgen `StructureMatcher.get_rms_dist()` with composition-aware permutation search — needed because their generated crystals don't have aligned atom indices. **We don't need that** because our candidates and references share fixed atom ordering (same triplet, same indices). Fixed-correspondence RMSD under PBC is simpler, faster, and exact for our case.
-    - They don't cluster — one-to-many greedy matching. **We do cluster** because the sampler yields many near-duplicate perturbation-driven candidates and we need distinct cluster centroids before scoring.
-    - They use greedy one-to-many matching. **We use Hungarian** (scipy `linear_sum_assignment`) because CLAUDE.md asks for one-to-one optimal assignment of centroids ↔ references.
-    - Their `structure_validity` (min interatomic distance < 0.5 Å) is the one piece genuinely useful for us; ported directly.
-    - Skipped: diffusion schedulers, GemNet, property conditioning, space-group checks, charge balance — none apply to saddles.
-    - `saddlegen/utils/eval.py` (~220 lines). Exports: `rmsd_pbc`, `pairwise_rmsd_pbc`, `cluster_by_rmsd`, `hungarian_match`, `validity_check`, `evaluate_predictions`, `aggregate_reactants`.
-    - Cluster representatives are **medoids**, not means — averaging positions under PBC is ill-defined without a reference anchor, medoid side-steps the issue.
-    - **Hungarian threshold gotcha:** LSA minimises total cost without respecting a per-pair threshold, so a single outlier can cascade into a globally-optimal but individually-pathological assignment. Fix: mask above-threshold entries to `1e9` in the cost matrix before LSA, so it prefers sub-threshold pairings first and only uses above-threshold pairings when unavoidable (then filtered post-LSA). Verified in-tree: outlier centroid is correctly left unmatched instead of forcing a miss on a well-matching pair.
-    - Verified in-tree: RMSD-PBC (identical=0, 0.1Å uniform=0.1, PBC wraparound 9.98→0.02), pairwise symmetric and monotone, clustering (10 structs in 3 groups → 3 clusters with correct labels), Hungarian diagonal on clean, outlier-resistant, sparse-recall case (1/2 refs matched gives recall=0.5), micro-aggregate correct.
-14. ~~Write `examples/LiC/train.py` and `evaluate.py`~~ **Done.** Example scripts are thin argparse + wiring around `saddlegen.*` primitives — no generic code leaks into the example. `convert.py` is omitted for Li/C since Backend A (`TrajTripletDataset`) reads `.traj` directly; conversion only pays off at 30M scale.
-    - **Refactor during this step:** generic helpers extracted from the example scripts into the library so the same primitives are reusable across projects:
-        - `saddlegen/utils/backbone.py` — `load_uma_backbone(name, device, freeze, eval_mode)` wraps fairchem's `get_predict_unit`, strips the `AveragedModel` wrapper + output heads, returns the `eSCNMDBackbone` directly.
-        - `saddlegen/utils/checkpointing.py` — `load_ema_weights(ckpt_dir, modules, device)` copies the `ema.pt` shadow into the trainable params of `modules` (trainable-param order must match `EMA.__init__`'s iteration).
-        - `saddlegen/data/core.py` — `atoms_to_sample_dict(atoms)` builds an inference-time sample dict (no saddle / metadata fields). `load_validated_triplets(paths)` returns the up-front list of validated `(R, S, P)` tuples; used by scripts that need to group triplets.
-        - `saddlegen/utils/eval.py` — `group_triplets_by_reactant(triplets, cell, threshold=0.02)` clusters triplets by PBC-RMSD on reactant positions; used by evaluation to aggregate multiple triplets' saddles onto a single unique reactant.
-    - **Evaluation protocol (implemented in `examples/LiC/evaluate.py`):** load train+test triplets, group test by reactant (PBC-RMSD < 0.02 Å), per unique reactant run the sampler → cluster candidates → Hungarian-match cluster centroids against that reactant's own known saddles (primary recall/precision/RMSD). Also report "bonus" matches against the full (train + test) saddle pool — any rediscovered TS from train is a valid TS, not a miss.
-    - **Verified against real Li/C data:** 12 train triplets → 10 unique reactants; 171 test triplets → 59 unique reactants (≈3 saddles per reactant on average, as expected for Li hopping between C-sheet adsorption sites). `<‖Δ‖>` = 1.25 Å on train, giving σ_rs_pert ≈ 0.036 Å via the rule-of-thumb. 127 atoms per system, 126 frozen Cs + 1 mobile Li. No `side` keys in the source trajs — positional ordering used throughout.
-    - **UMA charge/spin defaults corrected to (0, 0)** — the LiC traj `atoms.info` already carries `charge=0, spin=0`, and `spin=1` was never right for omat (UMA's `spin` is only physically used by the `omol` head).
-
-### Phase 3 — 30M training (after Li/C works)
-
-15. Scale the LMDB conversion to the full 30M dataset.
-16. Multi-node `accelerate` launch config and SLURM wrapper.
-17. Frozen-backbone baseline run.
-18. Fine-tuning run (lr 1e-5, optional LoRA).
-19. Ablations: `σ_rs_pert`, `σ_ts_pert`, `ε`, `w_1`, `w_3`, `K`, obj (1) on/off, `GlobalAttn` depth (and on/off as a sanity check of H7).
-
-### Phase 4 — Paper
-
-20. `refine.py` (optional Dimer refine using fairchem ASE Calculator) — only once we have good Phase 2 / 3 results.
-21. Methods section drafted from this CLAUDE.md; results and figures from Phase 2 + 3.
+What moved the needle:
+- **Finite-support geometric sampling inside one wedge** — exactly what ice-cream-cone is.
+- **Backbone `.eval()` override** and **time-embedding base fix** — both are load-bearing; without them the velocity field is time-independent or stochastic-feature-biased.
+- **10× more gradient steps per reactant** for LiC full (10k epochs × 12 batches/epoch vs LiC_simpler's 10k × 1) — undertrained single-reactant fields look like starburst even with the right sampling.
 
 ## Accuracy improvement levers (to revisit if Li/C recall is poor or 30M results plateau)
 
 When results disappoint, investigate roughly in this order — cheapest to most expensive in implementation effort, training cost, and risk of breaking what works.
 
 **Tier 1 — hyperparameter sweeps (no code change, hours of GPU time):**
-- `σ_rs_pert` — too small → no mode selection (collapses to mean saddle); too large → off-distribution starts. Sweep first.
-- `ε` (obj-3 flow-time cutoff) — controls how aggressively obj (3) supervises the early ray.
-- Loss weights `(w_1, w_2, w_3)` — try enabling obj (1), increasing `w_3`.
-- Inference integration steps `K` — increase before suspecting model error.
-- Time-sampling distribution in obj (2)/(3) — try logit-normal or beta-skewed in place of uniform.
+- `alpha` (cone half-angle) — our default 0.5 gives 30°, matching C_6v wedge width. Smaller α concentrates samples along the axis; larger α (only up to ~0.65 for LiC, above that the cone exits the wedge) spreads angularly. Sweep first if the field is too narrow or too washed out.
+- `R_max_abs` — matters only for reactions with `|Δ| > 2 Å` where `α·|Δ|` would be too large. For LiC default (1.0 Å) is fine.
+- `σ_inf` (inference-time perturbation around r_R, decoupled from training) — default 0.15 Å on LiC; sweep 0.10–0.30 if saddle diversity is low or trajectories land off-region.
+- `K` (inference Euler steps) — default 50; sweep 30–200 if trajectories stop short of saddles.
+- `loss_weights = (w_1, w_2)` — default `(1, 0)` is pure ice-cream-cone. Blending in obj 2 (Gaussian at r_R) may help for multi-mobile systems where the cone isn't directly defined.
 
 **Tier 2 — small architectural changes (hours of dev, no UMA retraining):**
-- `VelocityHead.depth` 1 → 2 → 3 (`SO3_Linear` + `Gate` stack, see §Head). Adds capacity above the frozen backbone.
-- `GlobalAttn` depth 1 → 2 → 4, heads 8 → 16. Improves long-range coordination.
+- `VelocityHead.depth` 1 → 2 → 3 (`SO3_Linear` + `UMAGate` stack). Adds capacity above the frozen backbone.
+- `GlobalAttn` depth 1 → 2 → 4, heads 8 → 16 — probably redundant on Li/C (see §Architecture note on 4-hop receptive field already ≥ cell), but may matter on >24 Å cells.
 - Higher-order integrator (Euler → torchdiffeq RK45) at inference.
-- Multiple supervision points per straight-line trajectory in obj (2)/(3) (currently one sample per draw — could draw 4 `t`s at once with shared `ε_rs_pert`).
 
 **Tier 3 — partial unfreeze of UMA (significant dev + retraining):**
 - `--finetune` end-to-end with `lr = 1e-5`, cosine warmup. Most likely lever if frozen baseline plateaus.
 - LoRA-style adapters on UMA's MOLE layers — preserves pretrained weights, much lower memory.
-- **Time-injection into UMA backbone (currently head-only).** Straight-line OT means `v_target` is constant in `t` along each trajectory, so head-only injection is theoretically defensible — but if accuracy is bad and integrator-error / capacity arguments are exhausted, this is the prime suspect. Two options, ascending intrusiveness:
-  - *Input-level:* learned `t` → MLP → scalar bias added to atom embedding inside `csd_embedding` (alongside charge/spin). Equivariant by construction. Requires unfreezing `csd_embedding` and probably the first eSCN-MD block. ~30 lines.
-  - *AdaLN at every block:* time-conditioned scalar `γ(t)` modulating each per-`l` RMSNorm (equivariant: scalars allowed on all `l`; shifts `β(t)` allowed only on `l=0`). What DiT/ADiT do for diffusion. Requires patching fairchem's eSCN-MD layer code. ~hundreds of lines, intrusive. Defer until the cheaper input-level variant is shown to be insufficient.
+- Time-injection into UMA backbone (currently head-only). Two options, ascending intrusiveness — see prior versions of this doc for details; defer unless Tier 1/2 don't solve the problem.
 
 **Tier 4 — bigger backbone (substantial cost, last resort):**
-- Swap UMA-S-1.2 → UMA-M-1.2 (K10L4: 10 layers, lmax=4 vs our K4L2's 4 layers, lmax=2). Strictly more capacity at every level. Multi-node from day one.
-- Conservative formulation analog: parameterize a scalar potential `Φ(x)` and define `v = -∇_x Φ` via autograd. Mathematically clean but requires re-deriving the entire flow loss; speculative.
+- Swap UMA-S-1.2 → UMA-M-1.2 (K10L4). Strictly more capacity at every level. Multi-node from day one.
 
 **Tier 5 — sampling / diversity (orthogonal to per-step accuracy):**
-- Sparse-Gaussian or Hessian-aware perturbation at inference (current Gaussian may under-represent the sparsest TS modes for large `M`).
-- Distance-sparse `GlobalAttn` (attend within 2× UMA cutoff) — for memory if dense attention OOMs on the 30M run.
+- Distance-sparse `GlobalAttn` (attend within 2 × UMA cutoff) — only if dense attention OOMs at 30M scale.
 
 ## Open questions (all empirical; to be settled on the Li/C test case)
 
-- **`σ_rs_pert`** — Gaussian std for obj (2) reactant-state perturbation and inference, in Å. Primary HP. Sweep roughly `σ_rs_pert ∈ {0.02, 0.05, 0.1, 0.2} · ⟨‖Δ‖⟩ / √(3M)` as anchor, then refine empirically.
-- **`ε`** — flow-time cutoff for obj (3), dimensionless. Sweep `{0.01, 0.05, 0.1}`.
-- **Loss weights** `(w_1, w_2, w_3)` — default `(0, 1, 2)`; ablate `w_1` on/off; sweep `w_3 ∈ {1, 2, 4}`.
-- **`σ_ts_pert`** — Gaussian std for obj (1) TS-state perturbation, in Å. Default `σ_ts_pert = σ_rs_pert`.
-- **Inference integration steps `K`** — default 50, sweep 20–200.
-- **`GlobalAttn` depth** — default 1 layer, ablate 1–4. Number of heads default 8.
-- **`VelocityHead.depth`** — default 1 (mirrors UMA's linear head exactly). For `depth ≥ 2`, stack `SO3_Linear → e3nn.nn.Gate → SO3_Linear`. Ablate `{1, 2, 3}` if capacity above the frozen backbone matters.
-- **Time-injection point** — default head-only (math justified for straight-line OT). Tier-3 ablation: input-level injection into `csd_embedding` (requires fine-tuning). Tier-5: AdaLN at every backbone block (intrusive).
-- **Distance-sparse `GlobalAttn`** — turn on only if dense attention becomes a bottleneck at the 30M scale.
-- **Fine-tuning LR and whether to use LoRA adapters** — second-iteration concern.
+- **`alpha`** — cone half-angle sweep. Default 0.5 worked on LiC; scan `{0.3, 0.5, 0.65}` on the 30M dataset to find the robust range across reactions with different local symmetries.
+- **`R_max_abs`** — only exercised for large-|Δ| reactions. Try `{0.7, 1.0, 1.5}` on reactions with |Δ| > 2 Å.
+- **`σ_inf`** — inference-time Li spread, default 0.15 Å. Sweep `{0.10, 0.15, 0.20, 0.30}` once full-dataset training lands.
+- **`K` (Euler steps)** — default 50; probe 30–200.
+- **`GlobalAttn` depth** — ablate 0 (off), 1, 2, 4 on the 30M run. For LiC cells (<24 Å) it's verifiably non-useful (2026-04-21 empirical probe).
+- **`VelocityHead.depth`** — 1 worked everywhere on LiC. Revisit at 30M scale.
+- **Frozen vs. fine-tuned UMA; LoRA** — second-iteration concerns.
+- **Multi-mobile atoms** — ice-cream-cone is single-mobile only today; either extend to per-atom cones or fall back to obj 2 (Gaussian) for those samples. Open design question.

@@ -6,8 +6,8 @@ Thin on purpose: AdamW + linear-warmup-then-cosine LR schedule + EMA + grad-clip
 infrastructure" explains why we skip fairchem's full stack.
 
 This module is agnostic to what's inside the loss module. It just needs:
-    loss_module(batch) -> {"loss": scalar tensor, "per_obj": (3,) long,
-                           "per_obj_loss": (3,) float, "n_mobile": int}
+    loss_module(batch) -> {"loss": scalar tensor, "per_obj": (2,) long,
+                           "per_obj_loss": (2,) float, "n_mobile": int}
 and a dataset yielding sample dicts consumed by `FlowMatchingLoss`.
 
 Multi-GPU / multi-node come free via `accelerate launch`:

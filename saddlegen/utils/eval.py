@@ -30,23 +30,37 @@ def _to_np(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64)
 
 
-def rmsd_pbc(x1, x2, cell) -> float:
+def rmsd_pbc(x1, x2, cell, mobile_mask=None) -> float:
     """Fixed-correspondence RMSD under PBC between two N-atom structures.
 
     `x1, x2` are `(N, 3)`; `cell` is `(3, 3)` with lattice vectors as rows.
     The minimum-image displacement is taken between every corresponding atom
     pair, so the result is invariant to independent wrap of either structure.
+
+    If `mobile_mask` is supplied (bool `(N,)`), only atoms where mask is True
+    contribute to the RMSD. Critical for systems with many frozen atoms — e.g.
+    a Li adsorbate on a frozen C-sheet has 126 frozen + 1 mobile atom; averaging
+    over all 127 dilutes the mobile-atom displacement by a factor √127 and
+    makes the metric essentially useless.
     """
     x1, x2, cell = _to_np(x1), _to_np(x2), _to_np(cell)
     delta = x1 - x2
     frac = delta @ np.linalg.inv(cell)
     frac -= np.round(frac)
-    delta = frac @ cell
-    return float(np.sqrt(np.mean(np.sum(delta * delta, axis=-1))))
+    delta = frac @ cell                                   # (N, 3)
+    sq = np.sum(delta * delta, axis=-1)                    # (N,)
+    if mobile_mask is not None:
+        m = np.asarray(mobile_mask, dtype=bool)
+        if m.any():
+            sq = sq[m]
+    return float(np.sqrt(np.mean(sq)))
 
 
-def pairwise_rmsd_pbc(structures, cell) -> np.ndarray:
-    """`(M, M)` symmetric matrix of pairwise RMSDs. `structures: (M, N, 3)`."""
+def pairwise_rmsd_pbc(structures, cell, mobile_mask=None) -> np.ndarray:
+    """`(M, M)` symmetric matrix of pairwise RMSDs. `structures: (M, N, 3)`.
+
+    See `rmsd_pbc` for the `mobile_mask` semantics — same rule applied here.
+    """
     S = _to_np(structures)
     cell = _to_np(cell)
     cell_inv = np.linalg.inv(cell)
@@ -55,6 +69,10 @@ def pairwise_rmsd_pbc(structures, cell) -> np.ndarray:
     frac -= np.round(frac)
     delta = frac @ cell
     sq = np.sum(delta * delta, axis=-1)                    # (M, M, N)
+    if mobile_mask is not None:
+        m = np.asarray(mobile_mask, dtype=bool)
+        if m.any():
+            sq = sq[..., m]
     return np.sqrt(sq.mean(axis=-1))                       # (M, M)
 
 
@@ -63,6 +81,7 @@ def cluster_by_rmsd(
     cell,
     cutoff: float = 0.1,
     linkage_method: str = "average",
+    mobile_mask=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Agglomerative clustering of candidate structures by pairwise RMSD-PBC.
 
@@ -76,6 +95,9 @@ def cluster_by_rmsd(
         cutoff: linkage-distance cutoff in Å (default 0.1, per CLAUDE.md).
         linkage_method: "average" (default), "complete", "single", or any
             scipy linkage method.
+        mobile_mask: optional `(N,)` bool. When supplied, the pairwise RMSD is
+            averaged over mobile atoms only (see `rmsd_pbc`). Strongly
+            recommended whenever most atoms are frozen.
 
     Returns:
         labels: `(M,)` 0-indexed cluster labels.
@@ -92,7 +114,7 @@ def cluster_by_rmsd(
     if M == 1:
         return np.zeros(1, dtype=int), S.copy(), np.zeros(1, dtype=int)
 
-    dm = pairwise_rmsd_pbc(S, cell)
+    dm = pairwise_rmsd_pbc(S, cell, mobile_mask=mobile_mask)
     condensed = squareform(dm, checks=False)
     Z = linkage(condensed, method=linkage_method)
     labels_1 = fcluster(Z, t=cutoff, criterion="distance")      # 1-indexed
@@ -116,11 +138,15 @@ def hungarian_match(
     references,
     cell,
     threshold: float = 0.1,
+    mobile_mask=None,
 ) -> tuple[list[tuple[int, int, float]], list[int], list[int]]:
     """One-to-one optimal assignment of centroids ↔ references by RMSD-PBC.
 
     Uses `scipy.optimize.linear_sum_assignment`. Pairs with RMSD > threshold
     are treated as unmatched even if the LSA paired them.
+
+    `mobile_mask` (optional, bool `(N,)`) narrows RMSD to mobile atoms only —
+    essential for systems where most atoms are frozen.
 
     Returns:
         matched: list of `(centroid_idx, ref_idx, rmsd)` below threshold.
@@ -139,7 +165,7 @@ def hungarian_match(
     cost = np.zeros((M, K))
     for i in range(M):
         for j in range(K):
-            cost[i, j] = rmsd_pbc(C[i], R[j], cell_np)
+            cost[i, j] = rmsd_pbc(C[i], R[j], cell_np, mobile_mask=mobile_mask)
 
     # Discourage above-threshold pairings *inside* the LSA by bumping their
     # cost to a value larger than any sub-threshold pairing. Without this
@@ -191,6 +217,7 @@ def evaluate_predictions(
     cluster_cutoff: float = 0.1,
     match_threshold: float = 0.1,
     linkage_method: str = "average",
+    mobile_mask=None,
 ) -> dict:
     """Cluster → Hungarian match → recall/precision/mean-RMSD, for one reactant.
 
@@ -207,9 +234,11 @@ def evaluate_predictions(
     R = _to_np(references)
     labels, centroids, medoids = cluster_by_rmsd(
         C, cell, cutoff=cluster_cutoff, linkage_method=linkage_method,
+        mobile_mask=mobile_mask,
     )
     matched, unm_c, unm_r = hungarian_match(
         centroids, R, cell, threshold=match_threshold,
+        mobile_mask=mobile_mask,
     )
     num_refs = int(R.shape[0])
     num_clusters = int(centroids.shape[0])

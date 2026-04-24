@@ -35,21 +35,37 @@ from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
 from fairchem.core.models.uma.outputs import get_l_component_range
 
 
-def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """Standard sinusoidal positional encoding for a scalar flow-time.
+def sinusoidal_time_embedding(t: torch.Tensor, dim: int,
+                                max_period: float = 1.0) -> torch.Tensor:
+    """Sinusoidal embedding for a scalar flow-time `t ∈ [0, max_period]`.
+
+    **Bug fix (2026-04-21).** The previous implementation used the stock
+    Transformer positional-encoding base of 10000, which is calibrated for
+    token positions up to ~10k (or DDPM-style discretized time T=1000). On
+    continuous flow-time in `[0, 1]`, that makes the highest-frequency dim
+    `sin(10000^{-31/32} · t) ≈ sin(1.3e-4 · t) ≈ 0` for the whole interval,
+    so 31 of 32 embedding dimensions carried essentially zero signal and
+    the time-FiLM effectively saw ~4 useful dims instead of 64.
+
+    Now we spread frequencies geometrically from 1 cycle up to `half` cycles
+    on `[0, max_period]` — so every dim varies meaningfully across the
+    interval without aliasing at realistic integration step counts (K~50).
 
     Args:
         t: scalar, 0-d tensor, or (B,) tensor of flow times.
         dim: embedding dimension; must be even.
+        max_period: the flow-time span. Default 1.0.
     Returns:
         (B, dim) where B = `t.numel()`.
     """
     assert dim % 2 == 0
     t = t.reshape(-1)
     half = dim // 2
-    freqs = torch.exp(
-        -math.log(10000.0) * torch.arange(half, dtype=t.dtype, device=t.device) / half
-    )
+    max_freq_cycles = float(half)
+    ks = torch.arange(half, dtype=t.dtype, device=t.device) / max(half - 1, 1)
+    freqs = (2.0 * math.pi / max_period) * torch.pow(
+        torch.tensor(max_freq_cycles, dtype=t.dtype, device=t.device), ks
+    )  # geometric 2π·1 → 2π·half (rad per unit flow-time)
     args = t.unsqueeze(-1) * freqs  # (B, half)
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 

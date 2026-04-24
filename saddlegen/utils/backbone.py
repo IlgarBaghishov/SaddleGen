@@ -31,6 +31,10 @@ def load_uma_backbone(
     predictor = get_predict_unit(name, device=device)
     # predictor.model is an AveragedModel(HydraModel); we want the backbone.
     backbone = predictor.model.module.backbone
+    # get_predict_unit only sets the CURRENT_DEVICE env var — it does not move
+    # module parameters. Force-move here so downstream code (evaluate.py without
+    # accelerate, ad-hoc sampling) sees parameters on the intended device.
+    backbone = backbone.to(device)
     if freeze:
         for p in backbone.parameters():
             p.requires_grad_(False)

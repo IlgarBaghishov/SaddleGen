@@ -26,7 +26,7 @@ def sample_saddles(
     backbone: nn.Module,
     global_attn: nn.Module,
     velocity_head: nn.Module,
-    sigma_rs_pert: float,
+    sigma_inf: float,
     n_perturbations: int = 32,
     K: int = 50,
     device: torch.device | str | None = None,
@@ -42,9 +42,9 @@ def sample_saddles(
         backbone / global_attn / velocity_head: the UMA backbone and the two
             SaddleGen modules. The caller is responsible for having set `.eval()`
             on them; this routine does NOT toggle training mode.
-        sigma_rs_pert: Gaussian std for `ε_rs_pert`, in Å. Should match the
-            `σ_rs_pert` used during training so inference sees the same
-            start-point distribution.
+        sigma_inf: Gaussian std (Å) for the inference-time perturbation that
+            spreads initial Li positions around r_R before Euler integration.
+            Decoupled from training; a value of ~0.15 is typical for LiC.
         n_perturbations: number of independent trajectories. Default 32.
         K: number of Euler steps. Default 50 per CLAUDE.md.
         device: override the device (default = `velocity_head`'s device).
@@ -80,7 +80,7 @@ def sample_saddles(
     else:
         mobile_gen = mobile
     eps_stack = torch.stack(
-        [gaussian_perturbation(mobile_gen, sigma_rs_pert, generator=generator)
+        [gaussian_perturbation(mobile_gen, sigma_inf, generator=generator)
          for _ in range(n_perturbations)],
         dim=0,
     ).to(device)  # (n_perturbations, N, 3)

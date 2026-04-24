@@ -45,12 +45,14 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--train-traj", default=str(here / "train_set.traj"))
     p.add_argument("--test-traj", default=str(here / "test_set.traj"))
-    p.add_argument("--ckpt-dir", default=str(here / "runs" / "head_only_v0" / "checkpoint_final"))
+    p.add_argument("--ckpt-dir", default=str(here / "runs" / "icecream_winner" / "checkpoint_final"))
 
     p.add_argument("--n-perturbations", type=int, default=32)
     p.add_argument("--K", type=int, default=50)
-    p.add_argument("--sigma-rs-pert", type=float, default=None,
-                   help="Å. If omitted, read from the training run's config.json extras.")
+    p.add_argument("--sigma-inf", type=float, default=0.15,
+                   help="Å. Inference-time perturbation around r_R that spreads initial "
+                        "conditions before Euler integration. Decoupled from training; "
+                        "0.15 is the value we verified on LiC.")
     p.add_argument("--cluster-cutoff", type=float, default=0.1)
     p.add_argument("--match-threshold", type=float, default=0.1)
     p.add_argument("--site-group-threshold", type=float, default=0.02,
@@ -69,17 +71,20 @@ def parse_args():
     p.add_argument("--output-json", default=None)
     p.add_argument("--limit-reactants", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-ema", action="store_true",
+                   help="load raw point-estimate weights instead of the EMA shadow. "
+                        "Useful for short runs where ema_decay=0.9999 leaves EMA at init.")
+    p.add_argument("--save-candidates", action="store_true",
+                   help="dump the raw 32-per-site candidate positions and the per-site "
+                        "reference saddles to <output-json>.candidates.npz so downstream "
+                        "tools can re-cluster / re-score without re-sampling.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     ckpt_dir = Path(args.ckpt_dir)
-    cfg_json = ckpt_dir.parent / "config.json"
-    if args.sigma_rs_pert is None and cfg_json.exists():
-        args.sigma_rs_pert = float(json.loads(cfg_json.read_text()).get("extras", {}).get("sigma_rs_pert", 0.05))
-        print(f"[eval] σ_rs_pert = {args.sigma_rs_pert:.5f} (from {cfg_json})")
-    assert args.sigma_rs_pert is not None, "supply --sigma-rs-pert if run config not present"
+    print(f"[eval] σ_inf = {args.sigma_inf:.5f} Å  (inference-time perturbation around r_R)")
 
     print(f"[eval] loading triplets")
     train_triplets = load_validated_triplets(args.train_traj)
@@ -129,10 +134,19 @@ def main():
     attn = GlobalAttn(sphere_channels=sc, lmax=lmax,
                        num_heads=args.attn_heads, num_layers=args.attn_layers).to(args.device)
     head = VelocityHead(sphere_channels=sc, input_lmax=lmax, depth=args.head_depth).to(args.device)
-    load_ema_weights(ckpt_dir, [attn, head], device=args.device)
+    load_ema_weights(ckpt_dir, [attn, head], device=args.device, use_ema=not args.no_ema)
+    print(f"[eval] loaded {'raw' if args.no_ema else 'EMA'} weights")
     for m in (attn, head): m.eval()
 
     per_site = []
+    saved_candidates = [] if args.save_candidates else None
+    saved_references = [] if args.save_candidates else None
+    # Mobile mask is identical across frames (FixAtoms is constant), read once.
+    import numpy as _np
+    _fx = test_triplets[0][0].constraints[0].index if test_triplets[0][0].constraints else _np.zeros(0, dtype=int)
+    _N = len(test_triplets[0][0])
+    mobile_mask = _np.ones(_N, dtype=bool)
+    mobile_mask[_fx] = False
     gen = torch.Generator().manual_seed(args.seed)
     for s_idx, site in enumerate(test_sites):
         rep_triplet = test_triplets[site.rep_triplet_idx]
@@ -149,20 +163,24 @@ def main():
         candidates = sample_saddles(
             atoms_to_sample_dict(rep_atoms),
             backbone, attn, head,
-            sigma_rs_pert=args.sigma_rs_pert,
+            sigma_inf=args.sigma_inf,
             n_perturbations=args.n_perturbations, K=args.K,
             device=args.device, generator=gen,
         ).cpu().numpy()
+        if args.save_candidates:
+            saved_candidates.append(candidates.astype(np.float32))
+            saved_references.append(known_saddles.astype(np.float32))
 
         res = evaluate_predictions(
             candidates, known_saddles, cell,
             cluster_cutoff=args.cluster_cutoff, match_threshold=args.match_threshold,
+            mobile_mask=mobile_mask,
         )
         centroids = candidates[res["medoid_indices"]]
 
         global_matches = []
         for c_idx, c in enumerate(centroids):
-            d = np.array([rmsd_pbc(c, g, cell) for g in global_saddles])
+            d = np.array([rmsd_pbc(c, g, cell, mobile_mask=mobile_mask) for g in global_saddles])
             j = int(np.argmin(d))
             global_matches.append({
                 "centroid_idx": c_idx, "nearest_global_idx": j,
@@ -215,6 +233,17 @@ def main():
     _report("ALL    ", agg_all)
     _report("NOVEL  ", agg_novel)
     _report("SHARED ", agg_shared)
+
+    if args.save_candidates:
+        out_npz = Path((args.output_json or "candidates.json")).with_suffix(".candidates.npz")
+        np.savez(
+            out_npz,
+            cell=cell,
+            mobile_mask=mobile_mask,
+            **{f"cand_{i:03d}": c for i, c in enumerate(saved_candidates)},
+            **{f"ref_{i:03d}": r for i, r in enumerate(saved_references)},
+        )
+        print(f"[eval] wrote candidate dump → {out_npz}")
 
     if args.output_json:
         Path(args.output_json).write_text(json.dumps(

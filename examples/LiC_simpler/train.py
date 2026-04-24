@@ -1,19 +1,15 @@
 """
-Train SaddleGen on the Li-on-C defective-graphene test case.
+Train SaddleGen on the symmetric Li-on-pristine-graphene test case.
 
-Data: `train_set.traj` with flat `[R1, S1, P1, R2, S2, P2, …]` ordering (no
-`side` info required — `validate_triplet` falls back to positional ordering).
-All reusable machinery lives in `saddlegen`; this script is only argparse +
-wiring.
-
-Sampling: ice-cream-cone of x_0 around the r_R → r_S axis. The per-sample
-ball radius at r_S is `R_TS = min(alpha · |Δ|, R_max)`; default alpha=0.5
-(30° cone half-angle) and R_max=1.0 Å.
+Data: `one_saddle.traj` — a single `[R, S, P]` triplet for one Li-hop on a
+defect-free carbon sheet (112 C + 1 Li, Li at index 112). The graphene
+lattice is 6-fold symmetric around a Li adsorption site, so there are 6
+equivalent saddles in the full symmetry orbit; we train on only one of
+them and rely on ice-cream-cone sampling + UMA's SO(3) equivariance to
+propagate the learned curving to all 6 wedges at inference.
 
 Launch:
-    python examples/LiC/train.py
-multi-GPU / multi-node:
-    accelerate launch --multi_gpu examples/LiC/train.py
+    CUDA_VISIBLE_DEVICES=0 python examples/LiC_simpler/train.py
 """
 
 import argparse
@@ -30,20 +26,23 @@ from saddlegen.utils import TrainingConfig, load_uma_backbone, train
 def parse_args():
     here = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--train-traj", default=str(here / "train_set.traj"))
+    p.add_argument("--train-traj", default=str(here / "one_saddle.traj"))
     p.add_argument("--output-dir", default=str(here / "runs" / "icecream_v0"))
 
+    # 1 triplet → 2 records after R/P doubling; with batch_size=2, 1 step/epoch.
+    # 10k steps matches the convergence timescale of the ice-cream-cone recipe.
     p.add_argument("--num-epochs", type=int, default=10000)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--learning-rate", type=float, default=1e-3)
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
-    p.add_argument("--ema-decay", type=float, default=0.9999)
+    # ~10k steps falls into the small-scale EMA rule; 0.99 ≈ 100-step window.
+    p.add_argument("--ema-decay", type=float, default=0.99)
     p.add_argument("--mixed-precision", default="bf16")
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--save-every-epochs", type=int, default=1000)
+    p.add_argument("--save-every-epochs", type=int, default=500)
 
     p.add_argument("--backbone", default="uma-s-1p2")
     p.add_argument("--attn-layers", type=int, default=1)
@@ -55,15 +54,13 @@ def parse_args():
                    help="cone half-angle = arcsin(alpha). Default 0.5 = 30°, "
                         "fits inside a C_6v wedge.")
     p.add_argument("--R-max", type=float, default=1.0,
-                   help="Å. Absolute cap on the ball radius at r_S. Prevents "
-                        "the cone from growing too large on reactions with |Δ| > 2/alpha.")
+                   help="Å. Absolute cap on the ball radius at r_S.")
 
     # obj 2 — reactant + Gaussian perturbation (disabled by default).
     p.add_argument("--sigma-rs-pert", type=float, default=None,
                    help="Å. Obj 2 Gaussian std at r_R. Default: rule-of-thumb "
                         "0.05·⟨‖Δ‖⟩/√(3M) from dataset stats. Only used if w_2 > 0.")
-    p.add_argument("--sigma-rs-factor", type=float, default=0.05,
-                   help="rule-of-thumb coefficient when --sigma-rs-pert is not set.")
+    p.add_argument("--sigma-rs-factor", type=float, default=0.05)
 
     # Objective mixing weights.
     p.add_argument("--w1", type=float, default=1.0, help="obj 1 (ice-cream-cone) weight")
@@ -85,11 +82,9 @@ def main():
     print(f"[train] {len(dataset)} records ({dataset.num_triplets} triplets × 2 sides), "
           f"<||Δ||> = {dataset.delta_norm_mean:.4f} Å")
 
-    # obj 2 σ_rs_pert rule-of-thumb.
     M = int((~dataset[0]["fixed"]).sum().item())
     sigma_rs = (args.sigma_rs_pert if args.sigma_rs_pert is not None
                 else args.sigma_rs_factor * dataset.delta_norm_mean / max(1, (3 * M) ** 0.5))
-
     print(f"[train] obj 1 (cone): alpha={args.alpha}  R_max={args.R_max} Å   w_1={args.w1}")
     print(f"[train] obj 2 (gauss): σ_rs_pert={sigma_rs:.5f} Å (M={M})   w_2={args.w2}")
 
@@ -97,10 +92,11 @@ def main():
     backbone = load_uma_backbone(args.backbone, device=args.device, freeze=True, eval_mode=True)
     sc, lmax = backbone.sphere_channels, backbone.lmax
     attn = GlobalAttn(sphere_channels=sc, lmax=lmax,
-                       num_heads=args.attn_heads, num_layers=args.attn_layers).to(args.device)
+                      num_heads=args.attn_heads, num_layers=args.attn_layers).to(args.device)
     head = VelocityHead(sphere_channels=sc, input_lmax=lmax, depth=args.head_depth).to(args.device)
     print(f"[train] backbone K{backbone.num_layers}L{lmax} (sphere_channels={sc}), frozen")
-    print(f"[train] trainable params: {sum(p.numel() for p in list(attn.parameters()) + list(head.parameters())):,}")
+    print(f"[train] trainable params: "
+          f"{sum(p.numel() for p in list(attn.parameters()) + list(head.parameters())):,}")
 
     loss_module = FlowMatchingLoss(
         FlowMatchingConfig(

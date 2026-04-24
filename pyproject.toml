@@ -25,6 +25,7 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "wandb",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
