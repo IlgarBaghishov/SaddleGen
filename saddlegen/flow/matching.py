@@ -55,6 +55,12 @@ class FlowMatchingConfig:
     R_max_abs: float = 1.0            # Å
     max_rejection_tries: int = 100
 
+    # Mode 1 v5 — Gaussian perturbation on x_t before backbone forward.
+    # Default 0.0 disables. Applied to mobile atoms only. Velocity target
+    # stays `saddle − x_0` (unchanged). Forces the model to encounter
+    # off-line samples where force at x_t is informative.
+    xt_perturb_sigma: float = 0.0
+
     def __post_init__(self):
         assert self.mode in (0, 1, 2), f"mode must be 0, 1, or 2, got {self.mode}"
         assert 0.0 < self.alpha <= 1.0, f"alpha must be in (0, 1], got {self.alpha}"
@@ -260,16 +266,38 @@ class FlowMatchingLoss(nn.Module):
         backbone: nn.Module,
         global_attn: nn.Module,
         velocity_head: nn.Module,
+        force_head: nn.Module | None = None,
+        force_tasks: dict | None = None,
     ):
+        """Args:
+            force_head, force_tasks: provided iff the velocity head was built
+                with `force_field_channels > 0` (Mode 1 v2+). The wrapper from
+                `saddlegen.utils.forces.load_uma_force_head` plus its tasks
+                dict; we use them at every forward to compute UMA-quality
+                forces at x_t and feed them to the head as an l=1 input.
+        """
         super().__init__()
         self.config = config
         self.backbone = backbone
         self.global_attn = global_attn
         self.velocity_head = velocity_head
+        self.force_head = force_head
+        # `tasks` is a dict of non-Module objects — store as a plain attribute,
+        # not a submodule. nn.Module.__setattr__ will correctly skip non-Module
+        # values, so this works.
+        self.force_tasks = force_tasks
+        if (force_head is None) != (getattr(velocity_head, "force_field_channels", 0) == 0):
+            raise ValueError(
+                "force_head must be provided iff velocity_head.force_field_channels > 0; "
+                f"got force_head={'set' if force_head is not None else 'None'}, "
+                f"force_field_channels={getattr(velocity_head, 'force_field_channels', 0)}"
+            )
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.backbone.eval()
+        if self.force_head is not None:
+            self.force_head.eval()
         return self
 
     @property
@@ -304,6 +332,18 @@ class FlowMatchingLoss(nn.Module):
             x0, x1, t, _ = sample_endpoints(sample, self.config, generator=generator)
             v_target = x1 - x0
             x_t_unwrapped = (1.0 - t) * x0 + t * x1
+            # Mode 1 v5 — perturb x_t with Gaussian noise on mobile atoms only.
+            # Target velocity stays `saddle − x_0`, so the model has to learn
+            # to predict that even from off-line points (where force is
+            # informative).
+            if self.config.xt_perturb_sigma > 0.0:
+                from ..data.transforms import gaussian_perturbation
+                mobile = ~sample["fixed"]
+                eps = gaussian_perturbation(
+                    mobile, self.config.xt_perturb_sigma,
+                    generator=generator, dtype=x_t_unwrapped.dtype,
+                )
+                x_t_unwrapped = x_t_unwrapped + eps
             x_t = wrap_positions(x_t_unwrapped, sample["cell"])
             data = build_atomic_data(
                 x_t, sample["Z"], sample["cell"],
@@ -333,25 +373,68 @@ class FlowMatchingLoss(nn.Module):
         if self.config.mode == 1:
             delta_partner_all = torch.cat(delta_partner_list, dim=0).to(device)
 
-        # If ANY backbone parameter requires grad (v1+ unfreezes blocks[-1]),
-        # we MUST run the backbone with autograd enabled. Otherwise (v0,
-        # frozen backbone) we use no_grad to free activation memory.
+        # Backbone forward needs grad-enabled mode if EITHER the backbone has
+        # trainable params (v1+ unfreezes blocks[-1]) OR we need to compute
+        # forces via autograd through the energy head (v2+).
         any_backbone_trainable = any(
             p.requires_grad for p in self.backbone.parameters()
         )
-        if isinstance(self.backbone, TimeFiLMBackbone):
-            backbone_call = lambda: self.backbone(batch_data, t_tensor, batch_idx)
-        else:
-            backbone_call = lambda: self.backbone(batch_data)
+        need_grad = any_backbone_trainable or (self.force_head is not None)
+        if self.force_head is not None:
+            # CRITICAL: positions must require grad BEFORE backbone forward,
+            # so the autograd graph captures pos → energy.
+            batch_data["pos"].requires_grad_(True)
 
-        if any_backbone_trainable:
+        is_v6_force_film = (
+            isinstance(self.backbone, TimeFiLMBackbone)
+            and getattr(self.backbone, "inject_force", False)
+        )
+
+        # First forward: no force-FiLM (force=None) so we can derive force.
+        if isinstance(self.backbone, TimeFiLMBackbone):
+            backbone_call = lambda f=None: self.backbone(batch_data, t_tensor, batch_idx, force=f)
+        else:
+            backbone_call = lambda f=None: self.backbone(batch_data)
+
+        if need_grad:
             feat = backbone_call()
         else:
             with torch.no_grad():
                 feat = backbone_call()
+
+        # Compute forces (Mode 1 v2+) BEFORE running the velocity head, so the
+        # autograd graph for forces is built first. Detach forces — we use
+        # them as features only, not as a path that should propagate gradients
+        # back into UMA.
+        force_field_all: torch.Tensor | None = None
+        if self.force_head is not None:
+            from ..utils.forces import compute_uma_forces
+            forces = compute_uma_forces(
+                batch_data, feat, self.force_head, self.force_tasks,
+                create_graph=False, task_name=batch[0]["task_name"],
+            )
+            force_field_all = forces.detach()
+
+            # v6: re-run the backbone WITH force-FiLM. This is the second pass
+            # of the two-pass scheme. Approx 2× backbone compute but the only
+            # way to feed force into UMA's blocks (we couldn't pre-compute
+            # force without first running backbone forward).
+            if is_v6_force_film:
+                # Need to re-prepare data["pos"].requires_grad for autograd
+                # consistency on the head's gradient path.
+                if need_grad:
+                    feat = self.backbone(batch_data, t_tensor, batch_idx, force=force_field_all)
+                else:
+                    with torch.no_grad():
+                        feat = self.backbone(batch_data, t_tensor, batch_idx, force=force_field_all)
+
         x = feat["node_embedding"]
         x = self.global_attn(x, batch_idx)
-        v = self.velocity_head(x, t_tensor, batch_idx, delta_endpoint=delta_partner_all)
+        v = self.velocity_head(
+            x, t_tensor, batch_idx,
+            delta_endpoint=delta_partner_all,
+            force_field=force_field_all,
+        )
         v = apply_output_projections(v, fixed_all, batch_idx, num_systems=B)
 
         sq_err = (v - v_target).pow(2).sum(dim=-1)  # (N_total,)

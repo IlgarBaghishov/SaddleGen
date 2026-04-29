@@ -48,7 +48,7 @@ Sits between the UMA backbone and the head. The **original motivation** was: whe
 
 ### Head — `VelocityHead`
 
-Custom, ~140 lines. Mirrors fairchem's `Linear_Force_Head` (a single equivariant `SO3_Linear(sphere_channels=128, 1, lmax=1)` projecting the `l=0,1` slice and keeping the `l=1` output reshaped to `(N, 3)`), but operates on the **globally-aware features from `GlobalAttn`** instead of directly on UMA's output. Implementation lives in `saddlegen/models/velocity_head.py`.
+Custom. Mirrors fairchem's `Linear_Force_Head` at depth=1 + time-FiLM, with optional Mode-1 conditioning paths (Δ_partner injection at `delta_endpoint_channels > 0`, force injection at `force_field_channels > 0`, force-residual at output) that are zero-init so the head is bit-for-bit a force-head when those switches are off. Implementation lives in `saddlegen/models/velocity_head.py`. **Production default (v6) uses depth=3 + Δ_P channels=32 + force channels=32, no force-residual** (see "Mode 1 architecture sweep" for why).
 
 **Implementation note: uses UMA's `SO3_Linear`, not e3nn's `o3.Linear`.** UMA stores irreps as `(N, (lmax+1)², C)` while e3nn flattens them to `(N, Irreps.dim)` — using e3nn would require ~50 lines of layout-conversion plumbing at every module boundary. `SO3_Linear` is the equivalent equivariant operation (independent per-l weights, bias only on `l=0`) and keeps us in UMA's native layout. The `UMAGate` nonlinearity (for `depth ≥ 2`) is a small hand-rolled equivalent of `e3nn.nn.Gate` that also works in UMA's layout — SiLU on `l=0` channels, sigmoid-of-linear(l=0) as a multiplicative gate on `l≥1` channels.
 
@@ -468,6 +468,30 @@ What moved the needle:
 - **Backbone `.eval()` override** and **time-embedding base fix** — both are load-bearing; without them the velocity field is time-independent or stochastic-feature-biased.
 - **10× more gradient steps per reactant** for LiC full (10k epochs × 12 batches/epoch vs LiC_simpler's 10k × 1) — undertrained single-reactant fields look like starburst even with the right sampling.
 
+## Mode 1 architecture sweep — what each version added (LiC, n=342 test trajectories, MIC distance, K=25 EMA)
+
+Mode 1 = product-conditional flow matching (the partner endpoint Δ_partner=MIC(P−x_t) is fed to the head as an l=1 input). All numbers below are the same Li/C test set, same K, same EMA setting; ranked by median test Li-error:
+
+| Version | Architecture delta from previous | Median | P95 | Max | Median z |
+|---|---|---|---|---|---|
+| **v0** | Mode-0 baseline (ice-cream-cone, frozen UMA, head_depth=1, no Δ_P)  | 0.135 Å | 0.220 | 0.317 | 118 mÅ |
+| **v1** | Mode 1 + head_depth=3 + early time-FiLM before blocks[-1] + unfreeze blocks[-1] + EMA 0.99 + GlobalAttn off | 0.045 | 0.159 | 0.310 | 30 mÅ |
+| **v2** | + UMA-force injection in head (autograd through energy block) | 0.037 | 0.166 | 0.325 | 21 mÅ |
+| **v3** | + ALSO unfreeze blocks[-2] + add a second time-FiLM injection point before blocks[-2] | 0.029 | 0.166 | 0.278 | 8 mÅ |
+| v4 | + force-residual at output: `v_out = v_raw − α·F`, α learnable scalar (init 0.1) | 0.029 | 0.160 | 0.271 | 8 mÅ |
+| v5 | + Gaussian perturbation σ=0.05 Å on x_t before backbone forward | 0.033 | 0.168 | **0.252** | 12 mÅ |
+| **v6 (default)** | + ForceFiLM at every TimeFiLMBackbone injection point (alongside existing time-FiLM) | **0.026** | **0.159** | 0.273 | **8 mÅ** |
+
+**Key qualitative findings.**
+- **v0 → v1 was the largest single jump.** Median 3× lower, z-error 4× lower. The architectural triple (head_depth=3 + unfrozen `blocks[-1]` + early time-FiLM before that block) consistently delivered the bulk of the improvement.
+- **97 % of v0's median test error was in z (out-of-plane Li height).** xy was already at 20 mÅ; z was at 118 mÅ. Every architectural lever past v1 mostly drove z down; xy stayed flat at 20–28 mÅ.
+- **v2's force injection alone gave a modest 1.2× improvement.** v3's second-block unfreezing + 2-point time-FiLM was a bigger jump than v2's force injection.
+- **v4's hardcoded force-residual barely helps.** The α learnable scalar drifts toward zero — the head can offset any residual via its own pipeline. Don't rely on residual subtraction to "force" force usage.
+- **v5's x_t-perturbation is the ONLY thing that improved the 7-ring outliers** (worst-case test triplets 109, 164 by ~25 mÅ). But the σ knob is wedge-knowledge in disguise (same sensitivity profile as the old ice-cream-cone α); too small → no effect, too large → wedge-leakage and equivariance collapse return. Hence not chosen as a default.
+- **v6 wins on bulk metrics** without a new hyperparameter — the ForceFiLM modules are zero-init and learn their own influence. **v6 is the production default.**
+- **The 7-ring failure mode is data-distribution, not architecture.** All architectural levers (v1→v6) hit the same wall on max-error/P99 because the 12-triplet train set never *forces* the model to use force (in the bulk-like training samples, the head can solve MSE without using force). Mode 2 (Dimer-trajectory) data — frames near defects with non-trivial force — is the structurally right next step, not another architectural sweep.
+- **Plateau at ~5000 epochs for every version v1+ on LiC.** Each model converges within ~3000–5000 epochs and gains nothing (or slightly worsens) over the remaining 5000–7000. Default `--num-epochs` could safely be cut from 10000 to 5000 if quick iteration is the goal; we keep 10000 to be conservative for the 30M-triplet run where data is plentiful and overfit risk is minimal.
+
 ## Accuracy improvement levers (to revisit if Li/C recall is poor or 30M results plateau)
 
 When results disappoint, investigate roughly in this order — cheapest to most expensive in implementation effort, training cost, and risk of breaking what works.
@@ -480,12 +504,13 @@ When results disappoint, investigate roughly in this order — cheapest to most 
 - `loss_weights = (w_1, w_2)` — default `(1, 0)` is pure ice-cream-cone. Blending in obj 2 (Gaussian at r_R) may help for multi-mobile systems where the cone isn't directly defined.
 
 **Tier 2 — small architectural changes (hours of dev, no UMA retraining):**
-- **TRY FIRST when Mode 1 accuracy disappoints — UMA layer-4 l≥1 outputs are NOT directly supervised.** UMA-S-1.2's only loss head is `MLP_EFS_Head`, which reads only the l=0 channels of layer 4's `node_embedding` (via a plain MLP) to predict energy, then derives forces by **autograd through positions** (no `Linear_Force_Head` exists in this checkpoint). Layer 4's l=1 and l=2 output slots are produced by equivariant operations and inherit gradient signal only via the chain rule going back to layer 4's own l=0 production — they were never targets of any UMA loss. They are equivariant by construction but not optimised for direct l≥1 readout. Verified by inspection of `MLP_EFS_Head.forward` on 2026-04-24.
+- **UPDATE 2026-04-29 — option (b) below has been verified empirically and is now the v6 production default; option (a) was not tried.** Selective unfreeze of `blocks[-1]` AND `blocks[-2]` with LR 1e-5 (vs head LR 1e-3) gave 4–5× lower median test error than the fully-frozen baseline; ForceFiLM at the same injection points pushed it slightly further. See "Mode 1 architecture sweep" above for the v0→v6 trajectory.
+- **UMA layer-4 l≥1 outputs are NOT directly supervised.** UMA-S-1.2's only loss head is `MLP_EFS_Head`, which reads only the l=0 channels of layer 4's `node_embedding` (via a plain MLP) to predict energy, then derives forces by **autograd through positions** (no `Linear_Force_Head` exists in this checkpoint). Layer 4's l=1 and l=2 output slots are produced by equivariant operations and inherit gradient signal only via the chain rule going back to layer 4's own l=0 production — they were never targets of any UMA loss. They are equivariant by construction but not optimised for direct l≥1 readout. Verified by inspection of `MLP_EFS_Head.forward` on 2026-04-24.
   Two fixes in increasing cost:
-  - **(a) Hook layer-3 features.** Register a forward hook on `backbone.transformer_blocks[2]` (penultimate of 4 layers) and use that captured tensor in place of `feat["node_embedding"]` everywhere we currently consume the backbone output. Layer 3's full irreps are *inputs* to layer 4's energy-producing computation, so they're heavily implicated in the autograd path and have richer l≥1 information than layer 4's outputs. Backbone stays fully frozen. ~30-line change in `utils/backbone.py` + a `pluck_layer=3` flag.
-  - **(b) Selectively unfreeze layer 4.** `for p in backbone.transformer_blocks[3].parameters(): p.requires_grad_(True)` plus a low LR (1e-5) on those params via a parameter-group split in the optimizer. More trainable params, fine-tuning risk if LR is too high, but keeps the architecture as-is.
-  My recommendation if Mode 1 plateaus: try (a) first (clean swap, low risk).
-- `VelocityHead.depth` 1 → 2 → 3 (`SO3_Linear` + `UMAGate` stack). Adds capacity above the frozen backbone.
+  - **(a) Hook layer-3 features.** Register a forward hook on `backbone.blocks[-2]` (penultimate of 4 layers) and use that captured tensor in place of `feat["node_embedding"]` everywhere we currently consume the backbone output. Layer 3's full irreps are *inputs* to layer 4's energy-producing computation, so they're heavily implicated in the autograd path and have richer l≥1 information than layer 4's outputs. Backbone stays fully frozen. **Not yet tried**; superseded operationally by (b) which we adopted instead.
+  - **(b) Selectively unfreeze blocks[-1] (and optionally blocks[-2]).** `for p in backbone.blocks[-1].parameters(): p.requires_grad_(True)` plus a low LR (1e-5) on those params via a parameter-group split in the optimizer. **This is the v1+ default.** v3 also unfreezes blocks[-2]; v6 (the current production default) builds on top of that.
+- **Force injection in the head and as a FiLM in the backbone.** Compute UMA's `F = −∂E/∂x_t` via autograd through the energy block (`saddlegen.utils.forces`) and feed it (a) to the velocity head as an l=1 feature alongside Δ_P (v2), and (b) as a per-injection-point ForceFiLM inside the unfrozen UMA blocks (v6). Both gave incremental wins. Don't bother with the force-residual variant (`v_out = v_raw − α·F`) — α drifts toward zero (v4 result).
+- `VelocityHead.depth` 1 → 2 → 3 (`SO3_Linear` + `UMAGate` stack). Adds capacity above the frozen backbone. depth=3 is the v1+ default.
 - `GlobalAttn` depth 0 → 1 → 2 → 4, heads 8 → 16 — currently 0 by default (Mode 1 has the partner direction so distant-site mediation isn't needed); may matter on >24 Å cells with multiple mobile atoms.
 - Higher-order integrator (Euler → torchdiffeq RK45) at inference.
 

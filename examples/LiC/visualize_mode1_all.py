@@ -92,22 +92,34 @@ def architecture_from_config(run_dir: Path):
         "attn_heads": int(extras.get("attn_heads", 8)),
         "head_depth": int(extras.get("head_depth", 1)),
         "delta_endpoint_channels": int(extras.get("delta_endpoint_channels", 0)),
+        "force_field_channels": int(extras.get("force_field_channels", 0)),
         "early_time_film": bool(extras.get("early_time_film", False)),
+        "early_time_film_blocks": str(extras.get("early_time_film_blocks", "-1")),
         "unfreeze_uma_last": bool(extras.get("unfreeze_uma_last", False)),
+        "unfreeze_uma_last2": bool(extras.get("unfreeze_uma_last2", False)),
+        "inject_force": bool(extras.get("inject_force", False)),
+        "force_residual": bool(extras.get("force_residual", False)),
+        "force_film": bool(extras.get("force_film", False)),
     }
 
 
 def build_model(arch, device):
-    """Reconstruct the architecture used at training time. Handles both v0
-    (frozen UMA, no early FiLM) and v1+ (unfrozen blocks[-1] + TimeFiLMBackbone)."""
+    """Reconstruct the architecture used at training time. Handles v0, v1, v2, v3."""
     from saddlegen.models.time_filmed_backbone import TimeFiLMBackbone
     raw_backbone = load_uma_backbone(
         "uma-s-1p2", device=device, freeze=True, eval_mode=True,
         unfreeze_last_block=arch["unfreeze_uma_last"],
     )
+    if arch.get("unfreeze_uma_last2", False):
+        for p in raw_backbone.blocks[-2].parameters():
+            p.requires_grad_(True)
     sc, lmax = raw_backbone.sphere_channels, raw_backbone.lmax
     if arch["early_time_film"]:
-        backbone = TimeFiLMBackbone(raw_backbone).to(device)
+        inject_idx = [int(x) for x in arch["early_time_film_blocks"].split(",")]
+        backbone = TimeFiLMBackbone(
+            raw_backbone, inject_block_indices=inject_idx,
+            inject_force=arch.get("force_film", False),
+        ).to(device)
     else:
         backbone = raw_backbone
     attn = GlobalAttn(sphere_channels=sc, lmax=lmax,
@@ -115,6 +127,8 @@ def build_model(arch, device):
     head = VelocityHead(
         sphere_channels=sc, input_lmax=lmax, depth=arch["head_depth"],
         delta_endpoint_channels=arch["delta_endpoint_channels"],
+        force_field_channels=arch.get("force_field_channels", 0),
+        force_residual=arch.get("force_residual", False),
     ).to(device)
     return backbone, attn, head
 
@@ -190,9 +204,9 @@ def build_records(train_triplets, test_triplets, cell):
 
 # ----- Batched Euler integration over many systems ----------------------------
 
-@torch.no_grad()
 def batched_euler(starts, partners, *, Z, cell, task_name, charge, spin, fixed,
-                  backbone, attn, head, K: int, chunk_size: int, device):
+                  backbone, attn, head, K: int, chunk_size: int, device,
+                  force_head=None, force_tasks=None):
     """starts, partners: (M, N, 3) float32 — Z/cell/task_name/charge/spin/fixed shared across systems.
 
     Each Euler step builds a single AtomicData batch from all M starts (in
@@ -246,16 +260,45 @@ def batched_euler(starts, partners, *, Z, cell, task_name, charge, spin, fixed,
 
             from saddlegen.models.time_filmed_backbone import TimeFiLMBackbone
             t_tensor = torch.full((chunk,), t_scalar, dtype=torch.float32, device=device)
-            if isinstance(backbone, TimeFiLMBackbone):
-                feat = backbone(batch_data, t_tensor, batch_idx)
-            else:
-                feat = backbone(batch_data)
-            h = attn(feat["node_embedding"], batch_idx)
-            v = head(h, t_tensor, batch_idx, delta_endpoint=delta_all)
-            v = apply_output_projections(v, fixed_all, batch_idx, num_systems=chunk)
-            v = v.view(chunk, N, 3)
 
-            x[s0:s1] = wrap_positions(x[s0:s1] + dt * v, cell_t)
+            is_v6_force_film = (
+                isinstance(backbone, TimeFiLMBackbone)
+                and getattr(backbone, "inject_force", False)
+            )
+
+            force_all = None
+            if force_head is not None:
+                with torch.enable_grad():
+                    batch_data["pos"].requires_grad_(True)
+                    if isinstance(backbone, TimeFiLMBackbone):
+                        feat = backbone(batch_data, t_tensor, batch_idx, force=None)
+                    else:
+                        feat = backbone(batch_data)
+                    from saddlegen.utils.forces import compute_uma_forces
+                    force_all = compute_uma_forces(
+                        batch_data, feat, force_head, force_tasks,
+                        create_graph=False, task_name=task_name,
+                    ).detach()
+
+                # v6: re-run with force-FiLM applied
+                if is_v6_force_film:
+                    with torch.no_grad():
+                        feat = backbone(batch_data, t_tensor, batch_idx, force=force_all)
+            else:
+                with torch.no_grad():
+                    if isinstance(backbone, TimeFiLMBackbone):
+                        feat = backbone(batch_data, t_tensor, batch_idx)
+                    else:
+                        feat = backbone(batch_data)
+
+            with torch.no_grad():
+                h = attn(feat["node_embedding"], batch_idx)
+                v = head(h, t_tensor, batch_idx,
+                         delta_endpoint=delta_all,
+                         force_field=force_all)
+                v = apply_output_projections(v, fixed_all, batch_idx, num_systems=chunk)
+                v = v.view(chunk, N, 3)
+                x[s0:s1] = wrap_positions(x[s0:s1] + dt * v, cell_t)
 
         traj[step + 1] = x
 
@@ -374,6 +417,14 @@ def main():
     # Build model once; we'll reload EMA weights per checkpoint.
     backbone, attn, head = build_model(arch, device)
 
+    # v2: load force head if the trained model used force injection.
+    force_head = None
+    force_tasks = None
+    if arch.get("force_field_channels", 0) > 0:
+        from saddlegen.utils.forces import load_uma_force_head
+        force_head, force_tasks = load_uma_force_head("uma-s-1p2", device=device)
+        print(f"[viz/all] force injection ON — loaded UMA force head")
+
     pattern = args.ckpt_glob
     if args.only_final:
         pattern = "checkpoint_final"
@@ -403,6 +454,7 @@ def main():
                 Z=Z, cell=cell32, task_name=task_name, charge=charge, spin=spin, fixed=fixed,
                 backbone=backbone, attn=attn, head=head,
                 K=args.K, chunk_size=args.chunk_size, device=device,
+                force_head=force_head, force_tasks=force_tasks,
             )
             t_run = time.time() - t1
 

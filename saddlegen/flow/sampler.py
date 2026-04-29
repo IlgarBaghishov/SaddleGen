@@ -21,7 +21,6 @@ from ..models.time_filmed_backbone import TimeFiLMBackbone
 from .matching import apply_output_projections, build_atomic_data
 
 
-@torch.no_grad()
 def sample_saddles(
     reactant: dict,
     backbone: nn.Module,
@@ -34,6 +33,8 @@ def sample_saddles(
     generator: torch.Generator | None = None,
     return_trajectory: bool = False,
     partner_pos: torch.Tensor | None = None,
+    force_head: nn.Module | None = None,
+    force_tasks: dict | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Euler-integrate `n_perturbations` trajectories from perturbed reactant to t=1.
 
@@ -108,6 +109,18 @@ def sample_saddles(
         )
     partner = partner_pos.to(device) if partner_pos is not None else None
 
+    # Mode 1 v2 force-head wiring.
+    head_v2 = getattr(velocity_head, "force_field_channels", 0) > 0
+    if head_v2 and force_head is None:
+        raise ValueError(
+            "velocity_head has force_field_channels>0 (Mode 1 v2) but "
+            "force_head was not provided to sample_saddles."
+        )
+    if (not head_v2) and force_head is not None:
+        raise ValueError(
+            "force_head was provided but velocity_head has force_field_channels==0."
+        )
+
     # Draw perturbations. Use CPU-side `mobile` if the generator is CPU, since
     # torch.randn requires generator.device == target device.
     if generator is not None and generator.device.type != device.type:
@@ -129,6 +142,10 @@ def sample_saddles(
     fixed_all = fixed.repeat(n_perturbations)  # (n_perturbations * N,)
     dt = 1.0 / K
 
+    # Inference loop. We can't use a global @torch.no_grad() decorator like
+    # the v0 sampler did — v2's force computation needs autograd through the
+    # energy block. Instead, scope no_grad() per-call below when forces
+    # aren't needed, and use enable_grad() when they are.
     for step in range(K):
         t_scalar = step / K
         t_tensor = torch.full(
@@ -151,19 +168,50 @@ def sample_saddles(
             )  # (n_perturbations, N, 3)
             delta_partner_all = delta_each.reshape(-1, 3)
 
-        if isinstance(backbone, TimeFiLMBackbone):
-            feat = backbone(batch_data, t_tensor, batch_idx)
+        is_v6_force_film = (
+            isinstance(backbone, TimeFiLMBackbone)
+            and getattr(backbone, "inject_force", False)
+        )
+
+        force_field_all: torch.Tensor | None = None
+        if force_head is not None:
+            # First pass — needs autograd for force computation.
+            with torch.enable_grad():
+                batch_data["pos"].requires_grad_(True)
+                if isinstance(backbone, TimeFiLMBackbone):
+                    feat = backbone(batch_data, t_tensor, batch_idx, force=None)
+                else:
+                    feat = backbone(batch_data)
+                from ..utils.forces import compute_uma_forces
+                force_field_all = compute_uma_forces(
+                    batch_data, feat, force_head, force_tasks,
+                    create_graph=False, task_name=task_name,
+                ).detach()
+
+            # v6 — second pass with force-FiLM applied at injection points.
+            if is_v6_force_film:
+                with torch.no_grad():
+                    feat = backbone(batch_data, t_tensor, batch_idx, force=force_field_all)
         else:
-            feat = backbone(batch_data)
-        h = global_attn(feat["node_embedding"], batch_idx)
-        v = velocity_head(h, t_tensor, batch_idx, delta_endpoint=delta_partner_all)
-        v = apply_output_projections(v, fixed_all, batch_idx, num_systems=n_perturbations)
-        v = v.view(n_perturbations, N, 3)
+            with torch.no_grad():
+                if isinstance(backbone, TimeFiLMBackbone):
+                    feat = backbone(batch_data, t_tensor, batch_idx)
+                else:
+                    feat = backbone(batch_data)
 
-        x = wrap_positions(x + dt * v, cell)
+        with torch.no_grad():
+            h = global_attn(feat["node_embedding"], batch_idx)
+            v = velocity_head(
+                h, t_tensor, batch_idx,
+                delta_endpoint=delta_partner_all,
+                force_field=force_field_all,
+            )
+            v = apply_output_projections(v, fixed_all, batch_idx, num_systems=n_perturbations)
+            v = v.view(n_perturbations, N, 3)
+            x = wrap_positions(x + dt * v, cell)
 
-        if return_trajectory:
-            traj[step + 1] = x
+            if return_trajectory:
+                traj[step + 1] = x
 
     if return_trajectory:
         return x, traj

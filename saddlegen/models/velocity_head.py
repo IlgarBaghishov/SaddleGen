@@ -136,16 +136,20 @@ class VelocityHead(nn.Module):
         time_embed_dim: int = 64,
         time_mlp_hidden: int = 128,
         delta_endpoint_channels: int = 0,
+        force_field_channels: int = 0,
+        force_residual: bool = False,
     ):
         super().__init__()
         assert depth >= 1
         assert input_lmax >= 1, "VelocityHead needs l=1 channels to emit (N, 3)"
         assert delta_endpoint_channels >= 0
+        assert force_field_channels >= 0
         self.sphere_channels = sphere_channels
         self.input_lmax = input_lmax
         self.depth = depth
         self.time_embed_dim = time_embed_dim
         self.delta_endpoint_channels = delta_endpoint_channels
+        self.force_field_channels = force_field_channels
 
         if delta_endpoint_channels > 0:
             self.delta_proj = SO3_Linear(1, delta_endpoint_channels, lmax=input_lmax)
@@ -156,6 +160,31 @@ class VelocityHead(nn.Module):
             # Training learns useful weights from the partner signal.
             nn.init.zeros_(self.delta_proj.weight)
             nn.init.zeros_(self.delta_proj.bias)
+
+        if force_field_channels > 0:
+            # Mode 1 v2: inject UMA's autograd-derived force at x_t. The force
+            # is a per-atom l=1 vector (eV/Å) — most directly DFT-supervised
+            # signal in the entire stack. Same projection-and-fuse pattern as
+            # delta_endpoint; zero-init so v2 head ≡ v1 head at init.
+            self.force_proj = SO3_Linear(1, force_field_channels, lmax=input_lmax)
+            self.force_fuse = SO3_Linear(
+                sphere_channels + force_field_channels, sphere_channels, lmax=input_lmax,
+            )
+            nn.init.zeros_(self.force_proj.weight)
+            nn.init.zeros_(self.force_proj.bias)
+
+        # Mode 1 v4 — force-residual at output:  v_out = v_raw − α · F.
+        # Learnable scalar α; init at 0.1 so force has *some* contribution from
+        # the start (so the model can't degenerate the residual to zero before
+        # the head's force-feature path even gets a chance). The head can still
+        # learn α=0 if the residual hurts, but it has to actively do so.
+        self.force_residual = bool(force_residual)
+        if self.force_residual:
+            assert force_field_channels > 0, (
+                "--force-residual requires --inject-force (force_field_channels > 0); "
+                "the residual reuses the same force tensor that's fed to the head."
+            )
+            self.force_residual_alpha = nn.Parameter(torch.tensor(0.1))
 
         self.time_mlp = nn.Sequential(
             nn.Linear(time_embed_dim, time_mlp_hidden),
@@ -187,12 +216,27 @@ class VelocityHead(nn.Module):
         fused = torch.cat([x, delta_feats], dim=-1)  # (N, num_sph, C+C_d)
         return self.delta_fuse(fused)  # (N, num_sph, C)
 
+    def _inject_force(self, x: torch.Tensor, force_field: torch.Tensor) -> torch.Tensor:
+        """Build the per-atom F irrep tensor and fuse into features.
+
+        force_field: (N, 3) per-atom force in eV/Å (from compute_uma_forces).
+        Returns: (N, num_sph, sphere_channels) — same shape as input x.
+        """
+        N, num_sph, _ = x.shape
+        irreps = torch.zeros(N, num_sph, 1, device=x.device, dtype=x.dtype)
+        irreps[:, 0, 0] = torch.linalg.norm(force_field, dim=-1)
+        irreps[:, 1:4, 0] = force_field
+        force_feats = self.force_proj(irreps)
+        fused = torch.cat([x, force_feats], dim=-1)
+        return self.force_fuse(fused)
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.Tensor,
         batch_idx: torch.Tensor | None = None,
         delta_endpoint: torch.Tensor | None = None,
+        force_field: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -214,8 +258,16 @@ class VelocityHead(nn.Module):
                 f"got delta_endpoint={'None' if delta_endpoint is None else 'tensor'}, "
                 f"delta_endpoint_channels={self.delta_endpoint_channels}"
             )
+        if (force_field is None) != (self.force_field_channels == 0):
+            raise ValueError(
+                "force_field must be provided iff force_field_channels > 0; "
+                f"got force_field={'None' if force_field is None else 'tensor'}, "
+                f"force_field_channels={self.force_field_channels}"
+            )
         if delta_endpoint is not None:
             x = self._inject_delta(x, delta_endpoint)
+        if force_field is not None:
+            x = self._inject_force(x, force_field)
 
         x_l01 = get_l_component_range(x, l_min=0, l_max=1)  # (N, 4, C)
 
@@ -243,4 +295,11 @@ class VelocityHead(nn.Module):
         for layer in self.layers:
             h = layer(h)
         out = self.final(h)  # (N, 4, 1)
-        return out[:, 1:4, :].reshape(-1, 3)
+        v = out[:, 1:4, :].reshape(-1, 3)
+
+        # Mode 1 v4 — force-residual at output. v_out = v_raw − α · F. Force
+        # is detached (we use it as a feature, not a learnable path), so the
+        # gradient of the residual term flows only into α.
+        if self.force_residual:
+            v = v - self.force_residual_alpha * force_field
+        return v
