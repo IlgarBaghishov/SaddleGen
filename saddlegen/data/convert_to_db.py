@@ -77,6 +77,7 @@ def convert(
                 },
                 data={
                     "saddle_un_pos": r["saddle_un_pos"],
+                    "partner_un_pos": r["partner_un_pos"],
                     "metadata": r["metadata"],
                 },
             )

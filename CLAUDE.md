@@ -480,12 +480,17 @@ When results disappoint, investigate roughly in this order — cheapest to most 
 - `loss_weights = (w_1, w_2)` — default `(1, 0)` is pure ice-cream-cone. Blending in obj 2 (Gaussian at r_R) may help for multi-mobile systems where the cone isn't directly defined.
 
 **Tier 2 — small architectural changes (hours of dev, no UMA retraining):**
+- **TRY FIRST when Mode 1 accuracy disappoints — UMA layer-4 l≥1 outputs are NOT directly supervised.** UMA-S-1.2's only loss head is `MLP_EFS_Head`, which reads only the l=0 channels of layer 4's `node_embedding` (via a plain MLP) to predict energy, then derives forces by **autograd through positions** (no `Linear_Force_Head` exists in this checkpoint). Layer 4's l=1 and l=2 output slots are produced by equivariant operations and inherit gradient signal only via the chain rule going back to layer 4's own l=0 production — they were never targets of any UMA loss. They are equivariant by construction but not optimised for direct l≥1 readout. Verified by inspection of `MLP_EFS_Head.forward` on 2026-04-24.
+  Two fixes in increasing cost:
+  - **(a) Hook layer-3 features.** Register a forward hook on `backbone.transformer_blocks[2]` (penultimate of 4 layers) and use that captured tensor in place of `feat["node_embedding"]` everywhere we currently consume the backbone output. Layer 3's full irreps are *inputs* to layer 4's energy-producing computation, so they're heavily implicated in the autograd path and have richer l≥1 information than layer 4's outputs. Backbone stays fully frozen. ~30-line change in `utils/backbone.py` + a `pluck_layer=3` flag.
+  - **(b) Selectively unfreeze layer 4.** `for p in backbone.transformer_blocks[3].parameters(): p.requires_grad_(True)` plus a low LR (1e-5) on those params via a parameter-group split in the optimizer. More trainable params, fine-tuning risk if LR is too high, but keeps the architecture as-is.
+  My recommendation if Mode 1 plateaus: try (a) first (clean swap, low risk).
 - `VelocityHead.depth` 1 → 2 → 3 (`SO3_Linear` + `UMAGate` stack). Adds capacity above the frozen backbone.
-- `GlobalAttn` depth 1 → 2 → 4, heads 8 → 16 — probably redundant on Li/C (see §Architecture note on 4-hop receptive field already ≥ cell), but may matter on >24 Å cells.
+- `GlobalAttn` depth 0 → 1 → 2 → 4, heads 8 → 16 — currently 0 by default (Mode 1 has the partner direction so distant-site mediation isn't needed); may matter on >24 Å cells with multiple mobile atoms.
 - Higher-order integrator (Euler → torchdiffeq RK45) at inference.
 
 **Tier 3 — partial unfreeze of UMA (significant dev + retraining):**
-- `--finetune` end-to-end with `lr = 1e-5`, cosine warmup. Most likely lever if frozen baseline plateaus.
+- `--finetune` end-to-end with `lr = 1e-5`, cosine warmup. Most likely lever if frozen baseline plateaus AND the layer-3-hook fix above didn't help.
 - LoRA-style adapters on UMA's MOLE layers — preserves pretrained weights, much lower memory.
 - Time-injection into UMA backbone (currently head-only). Two options, ascending intrusiveness — see prior versions of this doc for details; defer unless Tier 1/2 don't solve the problem.
 

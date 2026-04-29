@@ -115,7 +115,18 @@ def train(
     config: TrainingConfig,
     val_dataset: Dataset | None = None,
     val_every_epochs: int = 10,
+    param_groups: list[dict] | None = None,
 ) -> dict:
+    """Plain accelerate-based train loop.
+
+    `param_groups`, if provided, is passed straight to `AdamW` instead of the
+    default single-group `(trainable, lr=config.learning_rate)`. Use this for
+    discriminative LR setups (e.g. v1 with unfrozen UMA `blocks[-1]`: low LR
+    on the unfrozen backbone params, normal LR on the head). Each group is a
+    dict like `{"params": [...], "lr": ..., "weight_decay": ...}`. The cosine
+    + warmup schedule applies as a multiplicative factor on EVERY group's LR.
+    EMA is built over the union of all params across groups.
+    """
     # `accelerate` is imported lazily so EMA / TrainingConfig / identity_collate
     # can be used in environments where the dependency is not installed.
     from accelerate import Accelerator
@@ -150,7 +161,29 @@ def train(
     trainable = [p for p in loss_module.parameters() if p.requires_grad]
     if not trainable:
         raise ValueError("no parameters have requires_grad=True; nothing to train")
-    optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate, weight_decay=config.weight_decay)
+    if param_groups is None:
+        optimizer = torch.optim.AdamW(
+            trainable, lr=config.learning_rate, weight_decay=config.weight_decay,
+        )
+    else:
+        # Sanity: every entry in param_groups['params'] must have requires_grad.
+        # AdamW requires it; surface the violation here with a clearer message.
+        for i, g in enumerate(param_groups):
+            for p in g.get("params", []):
+                if not p.requires_grad:
+                    raise ValueError(
+                        f"param_groups[{i}] contains a parameter with requires_grad=False"
+                    )
+        optimizer = torch.optim.AdamW(
+            param_groups, lr=config.learning_rate, weight_decay=config.weight_decay,
+        )
+        if accelerator.is_main_process:
+            for i, g in enumerate(param_groups):
+                lr_i = g.get("lr", config.learning_rate)
+                wd_i = g.get("weight_decay", config.weight_decay)
+                n_i = sum(p.numel() for p in g.get("params", []))
+                print(f"[train] param_group[{i}] '{g.get('name', '?')}': "
+                      f"{n_i:,} params  lr={lr_i:.2e}  wd={wd_i:g}")
     total_steps = max(1, config.num_epochs * len(dataloader))
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -209,11 +242,9 @@ def train(
 
             if accelerator.is_main_process and global_step % config.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
-                per_obj = out["per_obj"].tolist()
-                po_loss = [f"{x:.4f}" if not math.isnan(x) else "nan"
-                           for x in out["per_obj_loss"].tolist()]
-                print(f"[train] ep {epoch:4d} step {global_step:7d} loss {loss_val:.4f} "
-                      f"lr {lr:.2e}  per_obj {per_obj}  per_obj_loss [{', '.join(po_loss)}]")
+                mode = int(out.get("mode", -1))
+                print(f"[train] ep {epoch:4d} step {global_step:7d} mode {mode} "
+                      f"loss {loss_val:.4f}  lr {lr:.2e}  n_mobile {out['n_mobile']}")
             global_step += 1
 
         mean_epoch_loss = epoch_loss / max(1, epoch_n)

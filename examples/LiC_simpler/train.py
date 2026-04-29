@@ -45,26 +45,27 @@ def parse_args():
     p.add_argument("--save-every-epochs", type=int, default=500)
 
     p.add_argument("--backbone", default="uma-s-1p2")
-    p.add_argument("--attn-layers", type=int, default=1)
+    p.add_argument("--attn-layers", type=int, default=0,
+                   help="Number of GlobalAttn layers. Default 0 (no attention) — "
+                        "Mode 1's partner direction already breaks the symmetry that "
+                        "GlobalAttn was originally introduced to handle.")
     p.add_argument("--attn-heads", type=int, default=8)
     p.add_argument("--head-depth", type=int, default=1)
 
-    # obj 1 — ice-cream-cone sampling of x_0.
+    # Training mode.
+    p.add_argument("--mode", type=int, default=1,
+                   help="0 = ice-cream-cone (legacy single-mobile-atom recipe); "
+                        "1 = product-conditional (uses partner endpoint, no noise) — DEFAULT; "
+                        "2 = Dimer-trajectory (NotImplementedError; dataset only).")
+    p.add_argument("--delta-endpoint-channels", type=int, default=32,
+                   help="Mode 1 only. Channel count for the partner-displacement "
+                        "feature in VelocityHead. Default 32 — analogue of time_embed_dim.")
+
+    # Mode 0 — ice-cream-cone sampling of x_0.
     p.add_argument("--alpha", type=float, default=0.5,
-                   help="cone half-angle = arcsin(alpha). Default 0.5 = 30°, "
-                        "fits inside a C_6v wedge.")
+                   help="cone half-angle = arcsin(alpha). Default 0.5 = 30°. Mode 0 only.")
     p.add_argument("--R-max", type=float, default=1.0,
-                   help="Å. Absolute cap on the ball radius at r_S.")
-
-    # obj 2 — reactant + Gaussian perturbation (disabled by default).
-    p.add_argument("--sigma-rs-pert", type=float, default=None,
-                   help="Å. Obj 2 Gaussian std at r_R. Default: rule-of-thumb "
-                        "0.05·⟨‖Δ‖⟩/√(3M) from dataset stats. Only used if w_2 > 0.")
-    p.add_argument("--sigma-rs-factor", type=float, default=0.05)
-
-    # Objective mixing weights.
-    p.add_argument("--w1", type=float, default=1.0, help="obj 1 (ice-cream-cone) weight")
-    p.add_argument("--w2", type=float, default=0.0, help="obj 2 (reactant Gaussian) weight")
+                   help="Å. Absolute cap on the ball radius at r_S. Mode 0 only.")
 
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -83,26 +84,35 @@ def main():
           f"<||Δ||> = {dataset.delta_norm_mean:.4f} Å")
 
     M = int((~dataset[0]["fixed"]).sum().item())
-    sigma_rs = (args.sigma_rs_pert if args.sigma_rs_pert is not None
-                else args.sigma_rs_factor * dataset.delta_norm_mean / max(1, (3 * M) ** 0.5))
-    print(f"[train] obj 1 (cone): alpha={args.alpha}  R_max={args.R_max} Å   w_1={args.w1}")
-    print(f"[train] obj 2 (gauss): σ_rs_pert={sigma_rs:.5f} Å (M={M})   w_2={args.w2}")
+    if args.mode == 0:
+        print(f"[train] mode 0 — ice-cream-cone")
+        print(f"[train] alpha={args.alpha}  R_max={args.R_max} Å  (M={M})")
+    elif args.mode == 1:
+        print(f"[train] mode 1 — product-conditional (no noise on x_0)")
+        print(f"[train] delta_endpoint_channels={args.delta_endpoint_channels}  (M={M})")
+    else:
+        raise SystemExit(f"--mode {args.mode} is not yet wired into the trainer "
+                         f"(mode 2 dataset is in place but the loss is not).")
 
     print(f"[train] loading backbone {args.backbone!r} onto {args.device}")
     backbone = load_uma_backbone(args.backbone, device=args.device, freeze=True, eval_mode=True)
     sc, lmax = backbone.sphere_channels, backbone.lmax
     attn = GlobalAttn(sphere_channels=sc, lmax=lmax,
                       num_heads=args.attn_heads, num_layers=args.attn_layers).to(args.device)
-    head = VelocityHead(sphere_channels=sc, input_lmax=lmax, depth=args.head_depth).to(args.device)
+    head_delta_C = args.delta_endpoint_channels if args.mode == 1 else 0
+    head = VelocityHead(
+        sphere_channels=sc, input_lmax=lmax, depth=args.head_depth,
+        delta_endpoint_channels=head_delta_C,
+    ).to(args.device)
     print(f"[train] backbone K{backbone.num_layers}L{lmax} (sphere_channels={sc}), frozen")
+    print(f"[train] attn_layers={args.attn_layers}  head_depth={args.head_depth}")
     print(f"[train] trainable params: "
           f"{sum(p.numel() for p in list(attn.parameters()) + list(head.parameters())):,}")
 
     loss_module = FlowMatchingLoss(
         FlowMatchingConfig(
+            mode=args.mode,
             alpha=args.alpha, R_max_abs=args.R_max,
-            sigma_rs_pert=sigma_rs,
-            loss_weights=(args.w1, args.w2),
         ),
         backbone, attn, head,
     )
@@ -116,9 +126,9 @@ def main():
         mixed_precision=args.mixed_precision, seed=args.seed,
         log_every=args.log_every, save_every_epochs=args.save_every_epochs,
         extras={
+            "mode": args.mode,
+            "delta_endpoint_channels": head_delta_C,
             "alpha": args.alpha, "R_max": args.R_max,
-            "sigma_rs_pert": sigma_rs,
-            "loss_weights": [args.w1, args.w2],
             "backbone": args.backbone,
             "attn_layers": args.attn_layers, "attn_heads": args.attn_heads,
             "head_depth": args.head_depth,

@@ -1,27 +1,28 @@
 """
 Flow-matching training loss for SaddleGen.
 
-Two straight-line OT objectives, selected per-sample by a weighted draw over
-`loss_weights = (w_1, w_2)`:
+Each `mode` of `FlowMatchingConfig` defines exactly one straight-line OT
+objective; modes are mutually exclusive (no per-sample mixing):
 
-    obj 1 — Ice-cream-cone around the r_R→r_S axis. x_0 is drawn uniformly from
-            the union of balls B(c, R(c)·|c−r_R|/|Δ|) for c on [r_R, r_S], with
-            R_TS = min(alpha·|Δ|, R_max_abs). This is the default (w_1=1, w_2=0)
-            and the recipe that produced the flower field in LiC / LiC_simpler.
+    Mode 0 — Ice-cream-cone around the r_R→r_S axis. x_0 is drawn uniformly
+             from the union of balls B(c, R(c)·|c−r_R|/|Δ|) for c on [r_R, r_S],
+             with R_TS = min(alpha·|Δ|, R_max_abs). Single mobile atom only;
+             the legacy recipe that produced the flower field on LiC / LiC_simpler.
 
-    obj 2 — Reactant + Gaussian. x_0 = r_R + ε, with ε ~ N(0, σ_rs_pert²·I_{3M})
-            on mobile atoms. Useful as a multimodality breaker / regularizer;
-            disabled by default (w_2 = 0) because in practice obj 1 on its own
-            already produces the correct curving field.
+    Mode 1 — Product-conditional (no noise). x_0 = start exactly; the head
+             receives a per-atom partner-displacement Δ_partner = MIC(partner − x_t)
+             at every flow step. The R/P doubling in the dataset gives a 50/50
+             R-side/P-side split per epoch automatically.
 
-See CLAUDE.md §"Flow formulation" for derivation and §"What was tried" for the
-history of why obj 1 (ice-cream-cone) replaced the previous three-objective
-scheme entirely.
+    Mode 2 — Dimer-trajectory (placeholder, not yet wired into the loss).
+             x_0 will be sampled uniformly from the saddle's Dimer + minimization
+             trajectory; the dataset reader is in place, the loss is not.
+
+See CLAUDE.md §"Flow formulation" for derivation.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -31,52 +32,38 @@ from ase.constraints import FixAtoms
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets.collaters.simple_collater import data_list_collater
 
-from ..data.transforms import gaussian_perturbation, wrap_positions
+from ..data.transforms import mic_displacement, wrap_positions
+from ..models.time_filmed_backbone import TimeFiLMBackbone
 
 
 @dataclass
 class FlowMatchingConfig:
     """Training-time sampling hyperparameters.
 
-    **obj 1 (ice-cream-cone)**:
-        `alpha`      cone half-angle is `arcsin(alpha)`; default 0.5 → 30°
-        `R_max_abs`  absolute cap on `R_TS` in Å; default 1.0
-        `R_TS = min(alpha·|Δ|, R_max_abs)` is computed per-sample.
-
-    **obj 2 (reactant Gaussian)**:
-        `sigma_rs_pert`  Gaussian std in Å for ε at r_R; default 0.036
-                        (LiC rule-of-thumb ≈ 0.05·⟨‖Δ‖⟩ / √(3M))
-
-    **Mixing**:
-        `loss_weights = (w_1, w_2)`. Per-sample objective is drawn as
-        `k ~ Categorical(w_1, w_2)`. Default (1.0, 0.0) — pure obj 1.
+    **mode** selects the recipe:
+        0 — Mode 0 (ice-cream-cone). Uses `alpha` and `R_max_abs`.
+        1 — Mode 1 (product-conditional). No knobs of its own here — the
+            partner-displacement injection is configured on the head
+            (`VelocityHead.delta_endpoint_channels > 0`).
+        2 — Mode 2 (trajectory). Raises until the loss is wired up.
     """
 
-    # obj 1 — ice-cream-cone
+    mode: int = 0
+
+    # Mode 0 — ice-cream-cone
     alpha: float = 0.5
     R_max_abs: float = 1.0            # Å
     max_rejection_tries: int = 100
 
-    # obj 2 — reactant Gaussian
-    sigma_rs_pert: float = 0.036      # Å
-
-    # mixing
-    loss_weights: tuple[float, float] = (1.0, 0.0)
-
     def __post_init__(self):
+        assert self.mode in (0, 1, 2), f"mode must be 0, 1, or 2, got {self.mode}"
         assert 0.0 < self.alpha <= 1.0, f"alpha must be in (0, 1], got {self.alpha}"
         assert self.R_max_abs > 0, f"R_max_abs must be positive, got {self.R_max_abs}"
-        assert self.sigma_rs_pert >= 0, f"sigma_rs_pert must be >= 0, got {self.sigma_rs_pert}"
-        assert len(self.loss_weights) == 2, f"loss_weights must be (w_1, w_2), got {self.loss_weights}"
-        assert sum(self.loss_weights) > 0, "at least one loss weight must be positive"
-
-
-def _draw_objective(loss_weights: tuple[float, float], n: int,
-                    generator: torch.Generator | None = None) -> torch.Tensor:
-    """Return (n,) long tensor of objective indices in {1, 2}."""
-    probs = torch.tensor(loss_weights, dtype=torch.float32)
-    probs = probs / probs.sum()
-    return torch.multinomial(probs, n, replacement=True, generator=generator) + 1
+        if self.mode == 2:
+            raise NotImplementedError(
+                "Mode 2 (Dimer-trajectory) loss is not implemented yet — only the "
+                "dataset scaffolding has landed. Use mode=0 or mode=1."
+            )
 
 
 def sample_icecream_cone(
@@ -144,27 +131,33 @@ def sample_icecream_cone(
 
 def sample_endpoints(
     sample: dict,
-    objective: int,
     config: FlowMatchingConfig,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]:
-    """Build one training example `(x_0, x_1, t, mobile_mask)` for the given objective.
+    """Build one training example `(x_0, x_1, t, mobile_mask)` per the config's mode.
 
-    obj 1 — ice-cream-cone sampling of x_0 (requires single mobile atom).
-    obj 2 — x_0 = r_R + ε, ε ~ Gaussian on mobile atoms (any mobile count).
+    Mode 0 — ice-cream-cone sampling of x_0 (requires single mobile atom).
+    Mode 1 — x_0 = start exactly (no noise). The partner-displacement vector
+             is computed inside `FlowMatchingLoss.forward` because it depends
+             on `x_t`, not just `(x_0, x_1)`.
     """
     r_start = sample["start_pos"]
     r_saddle = sample["saddle_un_pos"]
     mobile = ~sample["fixed"]
 
-    if objective == 1:
-        # Ice-cream-cone sampling (single-mobile-atom case only for now).
+    if config.mode == 1:
+        x0 = r_start.clone()
+        x1 = r_saddle
+        t = torch.rand((), generator=generator).item()
+        return x0, x1, t, mobile
+
+    if config.mode == 0:
         M = int(mobile.sum().item())
         if M != 1:
             raise NotImplementedError(
-                f"ice-cream-cone (obj 1) currently requires exactly one mobile atom; "
-                f"this sample has {M}. Use obj 2 (Gaussian) for multi-mobile systems, "
-                f"or extend sample_icecream_cone to handle multi-mobile cones."
+                f"Mode 0 (ice-cream-cone) currently requires exactly one mobile atom; "
+                f"this sample has {M}. Switch to Mode 1 (product-conditional) for "
+                f"multi-mobile systems, or extend sample_icecream_cone."
             )
         r_R_mob = r_start[mobile][0]
         r_S_mob = r_saddle[mobile][0]
@@ -183,20 +176,10 @@ def sample_endpoints(
             )
             x0[mobile] = x0_mob.unsqueeze(0)
         x1 = r_saddle
+        t = torch.rand((), generator=generator).item()
+        return x0, x1, t, mobile
 
-    elif objective == 2:
-        # Reactant + Gaussian perturbation. Works for any mobile count.
-        eps = gaussian_perturbation(
-            mobile, config.sigma_rs_pert, generator=generator, dtype=r_start.dtype,
-        )
-        x0 = r_start + eps
-        x1 = r_saddle
-
-    else:
-        raise ValueError(f"objective must be in {{1, 2}}, got {objective}")
-
-    t = torch.rand((), generator=generator).item()
-    return x0, x1, t, mobile
+    raise ValueError(f"unsupported mode {config.mode} in sample_endpoints")
 
 
 def build_atomic_data(
@@ -259,7 +242,7 @@ def apply_output_projections(
 
 
 class FlowMatchingLoss(nn.Module):
-    """Wraps `backbone + global_attn + velocity_head` with the two-objective loss.
+    """Wraps `backbone + global_attn + velocity_head` with the per-mode flow-matching loss.
 
     **Gotcha — backbone is kept in eval mode always.** UMA-S-1.2 has non-zero
     dropout / composition-dropout / mole-dropout (p=0.05–0.10) that would be
@@ -301,27 +284,27 @@ class FlowMatchingLoss(nn.Module):
         """Compute the flow-matching loss over a list of sample dicts.
 
         Returns a dict:
-            loss:         scalar (MSE averaged over mobile atoms)
-            per_obj:      (2,) long — count of samples assigned to obj 1 / 2
-            per_obj_loss: (2,) float — mean per-atom loss for each obj (NaN where count=0)
-            n_mobile:     int — total mobile-atom count contributing to the mean
+            loss:     scalar (MSE averaged over mobile atoms)
+            mode:     int — the active config mode (echoed for logging)
+            n_batch:  int — number of samples in the batch
+            n_mobile: int — total mobile-atom count contributing to the mean
         """
         device = self.device
         B = len(batch)
         if B == 0:
             raise ValueError("empty batch")
 
-        objectives = _draw_objective(self.config.loss_weights, B, generator=generator)
-
         data_list: list[AtomicData] = []
         v_targets: list[torch.Tensor] = []
         t_values: list[float] = []
         fixed_list: list[torch.Tensor] = []
+        delta_partner_list: list[torch.Tensor] = []  # only used in Mode 1
 
-        for sample, k in zip(batch, objectives.tolist()):
-            x0, x1, t, _ = sample_endpoints(sample, k, self.config, generator=generator)
+        for sample in batch:
+            x0, x1, t, _ = sample_endpoints(sample, self.config, generator=generator)
             v_target = x1 - x0
-            x_t = wrap_positions((1.0 - t) * x0 + t * x1, sample["cell"])
+            x_t_unwrapped = (1.0 - t) * x0 + t * x1
+            x_t = wrap_positions(x_t_unwrapped, sample["cell"])
             data = build_atomic_data(
                 x_t, sample["Z"], sample["cell"],
                 sample["task_name"], sample["charge"], sample["spin"],
@@ -332,18 +315,43 @@ class FlowMatchingLoss(nn.Module):
             t_values.append(t)
             fixed_list.append(sample["fixed"])
 
+            if self.config.mode == 1:
+                # Per-atom MIC-shortest displacement from x_t (wrapped) to the
+                # partner. Frozen atoms have partner == start so their delta is
+                # ~0 for the duration of the flow, which is the correct signal
+                # (frozen atoms have no partner-direction).
+                partner = sample["partner_un_pos"]
+                delta_partner_list.append(mic_displacement(partner, x_t, sample["cell"]))
+
         batch_data = data_list_collater(data_list, otf_graph=True).to(device)
         v_target = torch.cat(v_targets, dim=0).to(device)
         fixed_all = torch.cat(fixed_list, dim=0).to(device)
         t_tensor = torch.tensor(t_values, dtype=torch.float32, device=device)
         batch_idx = batch_data.batch
 
-        # Backbone is frozen — run it in no-grad to free activation memory.
-        with torch.no_grad():
-            feat = self.backbone(batch_data)
+        delta_partner_all: torch.Tensor | None = None
+        if self.config.mode == 1:
+            delta_partner_all = torch.cat(delta_partner_list, dim=0).to(device)
+
+        # If ANY backbone parameter requires grad (v1+ unfreezes blocks[-1]),
+        # we MUST run the backbone with autograd enabled. Otherwise (v0,
+        # frozen backbone) we use no_grad to free activation memory.
+        any_backbone_trainable = any(
+            p.requires_grad for p in self.backbone.parameters()
+        )
+        if isinstance(self.backbone, TimeFiLMBackbone):
+            backbone_call = lambda: self.backbone(batch_data, t_tensor, batch_idx)
+        else:
+            backbone_call = lambda: self.backbone(batch_data)
+
+        if any_backbone_trainable:
+            feat = backbone_call()
+        else:
+            with torch.no_grad():
+                feat = backbone_call()
         x = feat["node_embedding"]
         x = self.global_attn(x, batch_idx)
-        v = self.velocity_head(x, t_tensor, batch_idx)
+        v = self.velocity_head(x, t_tensor, batch_idx, delta_endpoint=delta_partner_all)
         v = apply_output_projections(v, fixed_all, batch_idx, num_systems=B)
 
         sq_err = (v - v_target).pow(2).sum(dim=-1)  # (N_total,)
@@ -355,26 +363,9 @@ class FlowMatchingLoss(nn.Module):
         else:
             loss = sq_err.sum() * 0.0
 
-        # Per-objective diagnostics (CPU-side, for logging only).
-        per_obj = torch.zeros(2, dtype=torch.long)
-        per_obj_loss = torch.full((2,), float("nan"))
-        atom_batch = batch_idx.detach().cpu()
-        sq_err_cpu = sq_err.detach().cpu()
-        mobile_cpu = mobile.detach().cpu()
-        for k in (1, 2):
-            sample_mask = (objectives == k)
-            per_obj[k - 1] = int(sample_mask.sum())
-            if sample_mask.any():
-                atom_sel = torch.isin(
-                    atom_batch, torch.nonzero(sample_mask, as_tuple=False).squeeze(-1),
-                )
-                m = atom_sel & mobile_cpu
-                if m.any():
-                    per_obj_loss[k - 1] = sq_err_cpu[m].mean()
-
         return {
             "loss": loss,
-            "per_obj": per_obj,
-            "per_obj_loss": per_obj_loss,
+            "mode": self.config.mode,
+            "n_batch": B,
             "n_mobile": n_mobile,
         }

@@ -55,9 +55,19 @@ class AseDbSaddleDataset(Dataset):
             if type(c).__name__ == "FixAtoms":
                 fixed[c.index] = True
 
+        # `partner_un_pos` was added in the Mode-1 release; older DBs may not
+        # have it. Fall back to a copy of `start_pos` (delta_partner = 0) so
+        # Mode-0 training continues to work, but Mode-1 training requires a DB
+        # converted with the new `convert_to_db`.
+        if "partner_un_pos" in data:
+            partner_un = torch.tensor(np.asarray(data["partner_un_pos"]), dtype=torch.float32)
+        else:
+            partner_un = torch.tensor(atoms.positions, dtype=torch.float32)
+
         return {
             "start_pos": torch.tensor(atoms.positions, dtype=torch.float32),
             "saddle_un_pos": torch.tensor(np.asarray(data["saddle_un_pos"]), dtype=torch.float32),
+            "partner_un_pos": partner_un,
             "Z": torch.tensor(atoms.numbers, dtype=torch.long),
             "cell": torch.tensor(np.asarray(atoms.cell), dtype=torch.float32),
             "fixed": torch.tensor(fixed, dtype=torch.bool),

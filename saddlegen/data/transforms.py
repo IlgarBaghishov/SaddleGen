@@ -30,6 +30,28 @@ def wrap_positions(positions: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
     return frac @ cell
 
 
+def mic_displacement(
+    target: torch.Tensor,
+    current: torch.Tensor,
+    cell: torch.Tensor,
+) -> torch.Tensor:
+    """Per-atom shortest-image displacement `target − current` under PBC.
+
+    Used by Mode-1 (product-conditional) flow: at each integration step we need
+    the vector from the current configuration `x_t` to a fixed partner endpoint
+    (R or P), and we want the *nearest periodic image* of the partner so the
+    direction is locally meaningful when `x_t` has been wrapped into the cell.
+
+    The fractional round-trip `frac = delta @ inv(cell); frac -= round(frac);
+    delta = frac @ cell` gives the unique image whose fractional coordinates
+    lie in [-½, ½]^3 — i.e., the closest one. Returns the same shape as input.
+    """
+    delta = target - current
+    frac = delta @ torch.linalg.inv(cell)
+    frac = frac - torch.round(frac)
+    return frac @ cell
+
+
 def gaussian_perturbation(
     mobile_mask: torch.Tensor,
     sigma: float | torch.Tensor,

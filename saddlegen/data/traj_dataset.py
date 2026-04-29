@@ -109,6 +109,7 @@ class TrajTripletDataset(Dataset):
         return {
             "start_pos": torch.from_numpy(r["start_pos"]),
             "saddle_un_pos": torch.from_numpy(r["saddle_un_pos"]),
+            "partner_un_pos": torch.from_numpy(r["partner_un_pos"]),
             "Z": torch.from_numpy(r["Z"]).long(),
             "cell": torch.from_numpy(r["cell"]),
             "fixed": torch.from_numpy(r["fixed"]),

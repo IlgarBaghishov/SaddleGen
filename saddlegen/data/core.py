@@ -110,15 +110,25 @@ def triplet_to_pair_records(
                 charge=charge, spin=spin, metadata=metadata,
                 triplet_id=int(triplet_id))
 
+    # Mode-1 partner: the OTHER local minimum (the one we are flowing AWAY from).
+    # Stored MIC-unwrapped relative to start so it lives in the same frame as
+    # `saddle_un_pos`. Frozen atoms have identical positions in R and P, so on
+    # those atoms `partner_un_pos == start_pos`, i.e. delta_partner = 0 — the
+    # head sees no spurious frozen-atom signal.
+    P_un_from_R = mic_unwrap(R.positions, P.positions, cell).astype(np.float32)
+    R_un_from_P = mic_unwrap(P.positions, R.positions, cell).astype(np.float32)
+
     return [
         dict(base,
              start_pos=R.positions.astype(np.float32),
              saddle_un_pos=S_un_from_R,
+             partner_un_pos=P_un_from_R,
              delta_norm=np.float32(np.linalg.norm(S_un_from_R - R.positions)),
              role="R2S"),
         dict(base,
              start_pos=P.positions.astype(np.float32),
              saddle_un_pos=S_un_from_P,
+             partner_un_pos=R_un_from_P,
              delta_norm=np.float32(np.linalg.norm(S_un_from_P - P.positions)),
              role="P2S"),
     ]

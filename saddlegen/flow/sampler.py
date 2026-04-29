@@ -16,7 +16,8 @@ import torch
 import torch.nn as nn
 from fairchem.core.datasets.collaters.simple_collater import data_list_collater
 
-from ..data.transforms import gaussian_perturbation, wrap_positions
+from ..data.transforms import gaussian_perturbation, mic_displacement, wrap_positions
+from ..models.time_filmed_backbone import TimeFiLMBackbone
 from .matching import apply_output_projections, build_atomic_data
 
 
@@ -32,8 +33,23 @@ def sample_saddles(
     device: torch.device | str | None = None,
     generator: torch.Generator | None = None,
     return_trajectory: bool = False,
+    partner_pos: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Euler-integrate `n_perturbations` trajectories from perturbed reactant to t=1.
+
+    **Mode 0 (default).** Pure flow-matching from `r_R + ε` to a saddle, no
+    partner conditioning. `velocity_head` must be a Mode-0 head
+    (`delta_endpoint_channels == 0`). Caller does NOT pass `partner_pos`.
+
+    **Mode 1 (`partner_pos` provided).** Product-conditional flow. The head is
+    Mode 1 (`delta_endpoint_channels > 0`) and at each Euler step we feed it
+    the per-atom MIC-shortest displacement from the current x_t to the partner
+    (the OTHER local minimum — P when starting from R, R when starting from P).
+    Mode 1 is deterministic given `partner_pos`; you typically pass `sigma_inf=0`
+    and `n_perturbations=1` to get a single deterministic prediction. To still
+    get a small ensemble (for clustering / robustness), pass a small `sigma_inf`
+    and >1 perturbations — the partner conditioning will keep all trajectories
+    aimed at the same saddle.
 
     Args:
         reactant: a sample dict with the same keys used by `FlowMatchingLoss`
@@ -44,7 +60,8 @@ def sample_saddles(
             on them; this routine does NOT toggle training mode.
         sigma_inf: Gaussian std (Å) for the inference-time perturbation that
             spreads initial Li positions around r_R before Euler integration.
-            Decoupled from training; a value of ~0.15 is typical for LiC.
+            Decoupled from training; a value of ~0.15 is typical for LiC Mode 0.
+            For Mode 1 a small value (or 0) is the natural choice.
         n_perturbations: number of independent trajectories. Default 32.
         K: number of Euler steps. Default 50 per CLAUDE.md.
         device: override the device (default = `velocity_head`'s device).
@@ -53,6 +70,9 @@ def sample_saddles(
             identical distribution, just less efficient.
         return_trajectory: if True, also return the full `(K+1, n_perturbations, N, 3)`
             tensor of intermediate positions (including the initial perturbed starts).
+        partner_pos: (N, 3) MIC-unwrapped partner positions (R or P). Required
+            for Mode 1, must be omitted for Mode 0. Same atom ordering as
+            `reactant['start_pos']`.
 
     Returns:
         `(n_perturbations, N, 3)` candidate saddle positions, wrapped into the unit cell.
@@ -72,6 +92,21 @@ def sample_saddles(
     spin = int(reactant["spin"])
     mobile = ~fixed
     N = r_R.shape[0]
+
+    # Mode-0 vs Mode-1 input validation against the head's configuration.
+    head_mode_1 = getattr(velocity_head, "delta_endpoint_channels", 0) > 0
+    if head_mode_1 and partner_pos is None:
+        raise ValueError(
+            "velocity_head is configured for Mode 1 (delta_endpoint_channels>0) "
+            "but partner_pos was not provided to sample_saddles."
+        )
+    if (not head_mode_1) and partner_pos is not None:
+        raise ValueError(
+            "partner_pos was provided but velocity_head is configured for Mode 0 "
+            "(delta_endpoint_channels==0). Either omit partner_pos or rebuild the "
+            "head with delta_endpoint_channels > 0."
+        )
+    partner = partner_pos.to(device) if partner_pos is not None else None
 
     # Draw perturbations. Use CPU-side `mobile` if the generator is CPU, since
     # torch.randn requires generator.device == target device.
@@ -106,9 +141,22 @@ def sample_saddles(
         batch_data = data_list_collater(data_list, otf_graph=True).to(device)
         batch_idx = batch_data.batch
 
-        feat = backbone(batch_data)
+        delta_partner_all: torch.Tensor | None = None
+        if partner is not None:
+            # Per-atom MIC displacement from each trajectory's current x[i] to
+            # the (shared) partner. (n_perturbations, N, 3) -> flat (P*N, 3).
+            delta_each = torch.stack(
+                [mic_displacement(partner, x[i], cell) for i in range(n_perturbations)],
+                dim=0,
+            )  # (n_perturbations, N, 3)
+            delta_partner_all = delta_each.reshape(-1, 3)
+
+        if isinstance(backbone, TimeFiLMBackbone):
+            feat = backbone(batch_data, t_tensor, batch_idx)
+        else:
+            feat = backbone(batch_data)
         h = global_attn(feat["node_embedding"], batch_idx)
-        v = velocity_head(h, t_tensor, batch_idx)
+        v = velocity_head(h, t_tensor, batch_idx, delta_endpoint=delta_partner_all)
         v = apply_output_projections(v, fixed_all, batch_idx, num_systems=n_perturbations)
         v = v.view(n_perturbations, N, 3)
 

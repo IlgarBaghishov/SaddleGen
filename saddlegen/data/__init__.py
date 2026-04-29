@@ -10,16 +10,19 @@ from .core import (
 )
 from .db_dataset import AseDbSaddleDataset
 from .traj_dataset import TrajTripletDataset
-from .transforms import gaussian_perturbation, wrap_positions
+from .trajectory_dataset import TrajectoryGroupedDataset
+from .transforms import gaussian_perturbation, mic_displacement, wrap_positions
 
 __all__ = [
     "AseDbSaddleDataset",
     "TrajTripletDataset",
+    "TrajectoryGroupedDataset",
     "atoms_to_sample_dict",
     "extract_fixed_mask",
     "gaussian_perturbation",
     "iter_triplets_from_traj_paths",
     "load_validated_triplets",
+    "mic_displacement",
     "mic_unwrap",
     "resolve_paths",
     "triplet_to_pair_records",
