@@ -9,12 +9,14 @@ from .core import (
     validate_triplet,
 )
 from .db_dataset import AseDbSaddleDataset
+from .materials_saddles_dataset import MaterialsSaddlesDataset
 from .traj_dataset import TrajTripletDataset
 from .trajectory_dataset import TrajectoryGroupedDataset
 from .transforms import gaussian_perturbation, mic_displacement, wrap_positions
 
 __all__ = [
     "AseDbSaddleDataset",
+    "MaterialsSaddlesDataset",
     "TrajTripletDataset",
     "TrajectoryGroupedDataset",
     "atoms_to_sample_dict",

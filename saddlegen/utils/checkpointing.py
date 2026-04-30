@@ -25,8 +25,9 @@ def load_ema_weights(
     If `use_ema=True` (default), loads the EMA shadow from `<ckpt_dir>/ema.pt`.
     If `use_ema=False`, loads the raw point-estimate weights from
     `<ckpt_dir>/model.safetensors` — useful when EMA decay is too aggressive for
-    a short run (ema_decay=0.9999 needs ~50k steps to escape init; small-dataset
-    runs with a few thousand steps leave EMA essentially at init).
+    the run length. Saturation is `1 − decay^N`, so 0.9999 reaches ~63% by 10k
+    steps and ~99% by 46k; runs of only a few thousand steps leave the EMA
+    dominated by the init shadow and the raw weights are usually preferable.
 
     Parameter order (for ema.pt) is inferred the same way as in `EMA.__init__`:
     iterate `modules` in the given order, take every parameter with

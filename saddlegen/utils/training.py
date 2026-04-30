@@ -115,6 +115,7 @@ def train(
     config: TrainingConfig,
     val_dataset: Dataset | None = None,
     val_every_epochs: int = 10,
+    test_dataset: Dataset | None = None,
     param_groups: list[dict] | None = None,
 ) -> dict:
     """Plain accelerate-based train loop.
@@ -151,6 +152,16 @@ def train(
     if val_dataset is not None:
         val_loader = DataLoader(
             val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=identity_collate,
+            num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0,
+        )
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             collate_fn=identity_collate,
@@ -196,6 +207,8 @@ def train(
     )
     if val_loader is not None:
         val_loader = accelerator.prepare(val_loader)
+    if test_loader is not None:
+        test_loader = accelerator.prepare(test_loader)
 
     start_epoch = 0
     global_step = 0
@@ -269,7 +282,20 @@ def train(
         (out_dir / "history.json").write_text(json.dumps(history, indent=2))
         print(f"[train] done. total time {(time.time() - t0) / 60:.2f} min")
 
-    return {"history": history, "global_step": global_step}
+    test_loss = None
+    if test_loader is not None:
+        test_loss = _evaluate(loss_module, test_loader, ema, accelerator)
+        if accelerator.is_main_process:
+            print(f"[test]  final  mean_loss {test_loss:.4f}  "
+                  f"(EMA weights, {len(test_loader)} batches × {config.batch_size})")
+            (out_dir / "test_results.json").write_text(json.dumps({
+                "test_loss": test_loss,
+                "global_step": global_step,
+                "epoch": config.num_epochs,
+                "weights": "ema",
+            }, indent=2))
+
+    return {"history": history, "global_step": global_step, "test_loss": test_loss}
 
 
 @torch.no_grad()
