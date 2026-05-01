@@ -266,10 +266,13 @@ def train(
                "elapsed_sec": time.time() - t0}
 
         if val_loader is not None and (epoch + 1) % val_every_epochs == 0:
-            val_loss = _evaluate(loss_module, val_loader, ema, accelerator)
-            rec["mean_val_loss"] = val_loss
+            val_losses = _evaluate(loss_module, val_loader, ema, accelerator)
+            rec["mean_val_loss_live"] = val_losses["live"]
+            rec["mean_val_loss_ema"] = val_losses["ema"]
+            rec["mean_val_loss"] = val_losses["ema"]  # backward-compat key
             if accelerator.is_main_process:
-                print(f"[val]   ep {epoch:4d} mean_loss {val_loss:.4f}")
+                print(f"[val]   ep {epoch:4d} live {val_losses['live']:.4f}  "
+                      f"ema {val_losses['ema']:.4f}")
 
         history.append(rec)
 
@@ -282,35 +285,51 @@ def train(
         (out_dir / "history.json").write_text(json.dumps(history, indent=2))
         print(f"[train] done. total time {(time.time() - t0) / 60:.2f} min")
 
-    test_loss = None
+    test_losses = None
     if test_loader is not None:
-        test_loss = _evaluate(loss_module, test_loader, ema, accelerator)
+        test_losses = _evaluate(loss_module, test_loader, ema, accelerator)
         if accelerator.is_main_process:
-            print(f"[test]  final  mean_loss {test_loss:.4f}  "
-                  f"(EMA weights, {len(test_loader)} batches × {config.batch_size})")
+            print(f"[test]  final  live {test_losses['live']:.4f}  "
+                  f"ema {test_losses['ema']:.4f}  "
+                  f"({len(test_loader)} batches × {config.batch_size})")
             (out_dir / "test_results.json").write_text(json.dumps({
-                "test_loss": test_loss,
+                "test_loss_live": test_losses["live"],
+                "test_loss_ema": test_losses["ema"],
+                "test_loss": test_losses["ema"],  # backward-compat key
                 "global_step": global_step,
                 "epoch": config.num_epochs,
-                "weights": "ema",
+                "weights": "live+ema",
             }, indent=2))
 
-    return {"history": history, "global_step": global_step, "test_loss": test_loss}
+    return {"history": history, "global_step": global_step,
+            "test_loss": test_losses}
 
 
 @torch.no_grad()
-def _evaluate(loss_module, val_loader, ema: EMA, accelerator) -> float:
+def _evaluate(loss_module, val_loader, ema: EMA, accelerator) -> dict:
+    """Returns {"live": float, "ema": float}. Reporting both surfaces EMA-decay
+    misconfiguration immediately — if decay is too high for the run length,
+    `ema` tracks initial-weight loss while `live` reflects training progress."""
     loss_module.eval()
-    ema.swap_in()
     try:
         total, n = 0.0, 0
         for batch in val_loader:
             out = loss_module(batch)
             total += accelerator.gather(out["loss"].detach()).mean().item()
             n += 1
-        return total / max(1, n)
+        live = total / max(1, n)
+        ema.swap_in()
+        try:
+            total, n = 0.0, 0
+            for batch in val_loader:
+                out = loss_module(batch)
+                total += accelerator.gather(out["loss"].detach()).mean().item()
+                n += 1
+            ema_loss = total / max(1, n)
+        finally:
+            ema.swap_out()
+        return {"live": live, "ema": ema_loss}
     finally:
-        ema.swap_out()
         loss_module.train()
 
 
