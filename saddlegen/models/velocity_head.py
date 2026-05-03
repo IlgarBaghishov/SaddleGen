@@ -152,12 +152,19 @@ class VelocityHead(nn.Module):
         self.force_field_channels = force_field_channels
 
         if delta_endpoint_channels > 0:
-            self.delta_proj = SO3_Linear(1, delta_endpoint_channels, lmax=input_lmax)
+            # v7-2a: head consumes TWO endpoints (R and P) per atom rather than
+            # one (the v6 partner-only signal). Input channel count to delta_proj
+            # is therefore 2 (one for delta_R, one for delta_P); output channels
+            # stay `delta_endpoint_channels`. delta_fuse output unchanged.
+            self.n_delta_endpoints = 2
+            self.delta_proj = SO3_Linear(
+                self.n_delta_endpoints, delta_endpoint_channels, lmax=input_lmax,
+            )
             self.delta_fuse = SO3_Linear(
                 sphere_channels + delta_endpoint_channels, sphere_channels, lmax=input_lmax,
             )
             # Zero-init so at init Mode 1 ≡ Mode 0 (Δ contributes nothing).
-            # Training learns useful weights from the partner signal.
+            # Training learns useful weights from the (R, P) endpoint signals.
             nn.init.zeros_(self.delta_proj.weight)
             nn.init.zeros_(self.delta_proj.bias)
 
@@ -203,18 +210,34 @@ class VelocityHead(nn.Module):
     def _inject_delta(self, x: torch.Tensor, delta_endpoint: torch.Tensor) -> torch.Tensor:
         """Build the per-atom Δ irrep tensor and fuse into UMA features.
 
-        delta_endpoint: (N, 3) per-atom partner displacement.
-        Returns: (N, num_sph, sphere_channels) — same shape as input x.
+        v7-2a: `delta_endpoint` is (N, n_ep, 3) — n_ep=2 for (delta_R, delta_P).
+        We pack it into a `(N, num_sph, n_ep)` irrep tensor and project to
+        `(N, num_sph, C_d)` via SO3_Linear(n_ep, C_d), then concat-and-fuse with
+        UMA features. The l=0 slot of channel k holds ‖delta_k‖ (an invariant);
+        the l=1 slots hold delta_k itself (an equivariant 3-vector); l≥2 stay 0.
+        Returns: (N, num_sph, sphere_channels).
         """
         N, num_sph, _ = x.shape
-        irreps = torch.zeros(N, num_sph, 1, device=x.device, dtype=x.dtype)
-        # l=0 slot at index 0: invariant magnitude.
-        irreps[:, 0, 0] = torch.linalg.norm(delta_endpoint, dim=-1)
-        # l=1 slots at indices 1..3: equivariant 3-vector.
-        irreps[:, 1:4, 0] = delta_endpoint
-        delta_feats = self.delta_proj(irreps)  # (N, num_sph, C_d)
-        fused = torch.cat([x, delta_feats], dim=-1)  # (N, num_sph, C+C_d)
-        return self.delta_fuse(fused)  # (N, num_sph, C)
+        if delta_endpoint.dim() != 3 or delta_endpoint.shape[-1] != 3:
+            raise ValueError(
+                f"v7-2a expects delta_endpoint of shape (N, n_ep, 3); "
+                f"got {tuple(delta_endpoint.shape)}"
+            )
+        n_ep = delta_endpoint.shape[1]
+        if n_ep != self.n_delta_endpoints:
+            raise ValueError(
+                f"delta_endpoint has {n_ep} endpoints but head was built with "
+                f"n_delta_endpoints={self.n_delta_endpoints}"
+            )
+        irreps = torch.zeros(N, num_sph, n_ep, device=x.device, dtype=x.dtype)
+        # l=0 slot, per channel: invariant magnitude of each delta vector.
+        irreps[:, 0, :] = torch.linalg.norm(delta_endpoint, dim=-1)        # (N, n_ep)
+        # l=1 slots (3 components), per channel: the delta vector itself.
+        # delta_endpoint is (N, n_ep, 3); we want (N, 3, n_ep) at indices 1..3.
+        irreps[:, 1:4, :] = delta_endpoint.transpose(-1, -2)               # (N, 3, n_ep)
+        delta_feats = self.delta_proj(irreps)                               # (N, num_sph, C_d)
+        fused = torch.cat([x, delta_feats], dim=-1)                         # (N, num_sph, C+C_d)
+        return self.delta_fuse(fused)                                       # (N, num_sph, C)
 
     def _inject_force(self, x: torch.Tensor, force_field: torch.Tensor) -> torch.Tensor:
         """Build the per-atom F irrep tensor and fuse into features.
@@ -237,6 +260,7 @@ class VelocityHead(nn.Module):
         batch_idx: torch.Tensor | None = None,
         delta_endpoint: torch.Tensor | None = None,
         force_field: torch.Tensor | None = None,
+        return_features: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -245,7 +269,8 @@ class VelocityHead(nn.Module):
                 `t` per system and a `batch_idx` of length N.
             batch_idx: (N,) long mapping each atom to its system (0..B-1).
                 May be None iff all atoms share a single scalar `t`.
-            delta_endpoint: (N, 3) per-atom partner displacement (Mode 1). When
+            delta_endpoint: (N, n_ep, 3) per-atom endpoint displacements (Mode 1).
+                v7-2a passes n_ep=2: [delta_R, delta_P] per atom. When
                 `delta_endpoint_channels == 0` this must be None; otherwise it
                 must be provided.
         Returns:
@@ -294,6 +319,9 @@ class VelocityHead(nn.Module):
 
         for layer in self.layers:
             h = layer(h)
+        # v7-2a1a: capture pre-final tensor `h` so the EigenmodeHead can read
+        # the same trunk features the velocity head's final SO3_Linear sees.
+        # `h` shape is (N, 4, sphere_channels) — l=0,1 only.
         out = self.final(h)  # (N, 4, 1)
         v = out[:, 1:4, :].reshape(-1, 3)
 
@@ -302,4 +330,6 @@ class VelocityHead(nn.Module):
         # gradient of the residual term flows only into α.
         if self.force_residual:
             v = v - self.force_residual_alpha * force_field
+        if return_features:
+            return v, h
         return v

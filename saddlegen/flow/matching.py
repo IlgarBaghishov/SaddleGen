@@ -152,7 +152,16 @@ def sample_endpoints(
     mobile = ~sample["fixed"]
 
     if config.mode == 1:
-        x0 = r_start.clone()
+        # v7-2a: start integration from the midpoint between R (start) and P
+        # (partner_un_pos), instead of from R. partner_un_pos is already
+        # MIC-unwrapped relative to start, so the arithmetic mean is the
+        # PBC-correct geodesic midpoint. Re-parameterizes the L2-Bayes-optimal
+        # predictor from `E[saddle] - start ≈ midpoint - start` (large) to
+        # `E[saddle] - midpoint ≈ 0`, forcing the head to use its features to
+        # predict the *residual* deviation of the saddle from the midpoint
+        # instead of rediscovering the midpoint itself.
+        partner = sample["partner_un_pos"]
+        x0 = 0.5 * (r_start + partner)
         x1 = r_saddle
         t = torch.rand((), generator=generator).item()
         return x0, x1, t, mobile
@@ -268,6 +277,8 @@ class FlowMatchingLoss(nn.Module):
         velocity_head: nn.Module,
         force_head: nn.Module | None = None,
         force_tasks: dict | None = None,
+        eigenmode_head: nn.Module | None = None,
+        eigenmode_loss_weight: float = 0.0,
     ):
         """Args:
             force_head, force_tasks: provided iff the velocity head was built
@@ -275,6 +286,12 @@ class FlowMatchingLoss(nn.Module):
                 `saddlegen.utils.forces.load_uma_force_head` plus its tasks
                 dict; we use them at every forward to compute UMA-quality
                 forces at x_t and feed them to the head as an l=1 input.
+            eigenmode_head: v7-2a1a auxiliary head. When provided, the loss
+                gains a sign-invariant cos²-similarity term against
+                `sample["eigenmode"]`, weighted by `eigenmode_loss_weight`.
+                Used only at training; ignored at inference.
+            eigenmode_loss_weight: scalar multiplier on the eigenmode aux loss.
+                v7-2a1a default is 0.1.
         """
         super().__init__()
         self.config = config
@@ -286,6 +303,12 @@ class FlowMatchingLoss(nn.Module):
         # not a submodule. nn.Module.__setattr__ will correctly skip non-Module
         # values, so this works.
         self.force_tasks = force_tasks
+        self.eigenmode_head = eigenmode_head
+        self.eigenmode_loss_weight = float(eigenmode_loss_weight)
+        if (eigenmode_head is None) and self.eigenmode_loss_weight > 0:
+            raise ValueError(
+                "eigenmode_loss_weight > 0 requires an eigenmode_head; got None."
+            )
         if (force_head is None) != (getattr(velocity_head, "force_field_channels", 0) == 0):
             raise ValueError(
                 "force_head must be provided iff velocity_head.force_field_channels > 0; "
@@ -327,6 +350,7 @@ class FlowMatchingLoss(nn.Module):
         t_values: list[float] = []
         fixed_list: list[torch.Tensor] = []
         delta_partner_list: list[torch.Tensor] = []  # only used in Mode 1
+        eigenmode_targets: list[torch.Tensor] = []   # v7-2a1a: only when aux head set
 
         for sample in batch:
             x0, x1, t, _ = sample_endpoints(sample, self.config, generator=generator)
@@ -356,12 +380,29 @@ class FlowMatchingLoss(nn.Module):
             fixed_list.append(sample["fixed"])
 
             if self.config.mode == 1:
-                # Per-atom MIC-shortest displacement from x_t (wrapped) to the
-                # partner. Frozen atoms have partner == start so their delta is
-                # ~0 for the duration of the flow, which is the correct signal
-                # (frozen atoms have no partner-direction).
+                # v7-2a: pass BOTH (R - x_t) and (P - x_t) as per-atom MIC
+                # displacements. Starting from the midpoint, the head needs to
+                # know where both endpoints sit relative to the current point;
+                # passing only the partner (as the v6 head did) loses the
+                # symmetric R-side information. Stacked as (N, 2, 3); the head
+                # now expects a 2-endpoint delta signal.
+                start_pos = sample["start_pos"]
                 partner = sample["partner_un_pos"]
-                delta_partner_list.append(mic_displacement(partner, x_t, sample["cell"]))
+                delta_R = mic_displacement(start_pos, x_t, sample["cell"])
+                delta_P = mic_displacement(partner, x_t, sample["cell"])
+                delta_partner_list.append(torch.stack([delta_R, delta_P], dim=1))
+
+            # v7-2a1a: collect eigenmode targets when aux head is enabled.
+            # `eigenmode` is (N, 3); frozen-atom rows are 0 by construction
+            # (DFT eigenmodes vanish on FixAtoms by definition).
+            if self.eigenmode_loss_weight > 0:
+                eig = sample.get("eigenmode")
+                if eig is None:
+                    raise KeyError(
+                        "eigenmode aux loss enabled but sample dict has no "
+                        "'eigenmode' key — check the dataset adapter."
+                    )
+                eigenmode_targets.append(eig)
 
         batch_data = data_list_collater(data_list, otf_graph=True).to(device)
         v_target = torch.cat(v_targets, dim=0).to(device)
@@ -371,6 +412,7 @@ class FlowMatchingLoss(nn.Module):
 
         delta_partner_all: torch.Tensor | None = None
         if self.config.mode == 1:
+            # v7-2a: shape is (N_total, 2, 3) — [delta_R, delta_P] per atom.
             delta_partner_all = torch.cat(delta_partner_list, dim=0).to(device)
 
         # Backbone forward needs grad-enabled mode if EITHER the backbone has
@@ -430,11 +472,20 @@ class FlowMatchingLoss(nn.Module):
 
         x = feat["node_embedding"]
         x = self.global_attn(x, batch_idx)
-        v = self.velocity_head(
+        # v7-2a1a: when an eigenmode aux head is set, request the velocity
+        # head's pre-final trunk features `h` so the aux head can read them.
+        want_features = self.eigenmode_loss_weight > 0
+        head_out = self.velocity_head(
             x, t_tensor, batch_idx,
             delta_endpoint=delta_partner_all,
             force_field=force_field_all,
+            return_features=want_features,
         )
+        if want_features:
+            v, h_trunk = head_out
+        else:
+            v = head_out
+            h_trunk = None
         v = apply_output_projections(v, fixed_all, batch_idx, num_systems=B)
 
         sq_err = (v - v_target).pow(2).sum(dim=-1)  # (N_total,)
@@ -442,12 +493,47 @@ class FlowMatchingLoss(nn.Module):
         n_mobile = int(mobile.sum().item())
 
         if n_mobile > 0:
-            loss = sq_err[mobile].mean()
+            velocity_loss = sq_err[mobile].mean()
         else:
-            loss = sq_err.sum() * 0.0
+            velocity_loss = sq_err.sum() * 0.0
+
+        eigenmode_loss = torch.tensor(0.0, device=device, dtype=velocity_loss.dtype)
+        if want_features:
+            # Concatenate per-sample (N_b, 3) eigenmodes into (N_total, 3).
+            eig_target = torch.cat(eigenmode_targets, dim=0).to(device).to(velocity_loss.dtype)
+            eig_pred = self.eigenmode_head(h_trunk)            # (N_total, 3)
+
+            # Sign-invariant per-system cos² loss. The full eigenmode is a
+            # 3N_b-vector (one per system); compute its cosine with the target
+            # in 3N_b space using per-atom dot/norm sums via index_add.
+            mob_f = mobile.to(velocity_loss.dtype).unsqueeze(-1)        # (N_total, 1)
+            ep = eig_pred * mob_f                                        # zero on frozen
+            et = eig_target * mob_f
+            inner_atom = (ep * et).sum(dim=-1)                           # (N_total,)
+            np_atom = (ep * ep).sum(dim=-1)
+            nt_atom = (et * et).sum(dim=-1)
+
+            inner_sys = torch.zeros(B, device=device, dtype=velocity_loss.dtype)
+            np_sys    = torch.zeros(B, device=device, dtype=velocity_loss.dtype)
+            nt_sys    = torch.zeros(B, device=device, dtype=velocity_loss.dtype)
+            inner_sys.index_add_(0, batch_idx, inner_atom)
+            np_sys.index_add_(0, batch_idx, np_atom)
+            nt_sys.index_add_(0, batch_idx, nt_atom)
+
+            # cos² invariant to sign of either pred or target eigenvector;
+            # invariant to scaling of either. 1e-12 guards init when pred ≈ 0.
+            cos_sq = (inner_sys ** 2) / (np_sys * nt_sys + 1e-12)
+            # Skip systems whose target eigenmode is degenerate (norm ≈ 0).
+            valid = nt_sys > 1e-8
+            if valid.any():
+                eigenmode_loss = (1.0 - cos_sq[valid]).mean()
+
+        loss = velocity_loss + self.eigenmode_loss_weight * eigenmode_loss
 
         return {
             "loss": loss,
+            "velocity_loss": velocity_loss.detach(),
+            "eigenmode_loss": eigenmode_loss.detach(),
             "mode": self.config.mode,
             "n_batch": B,
             "n_mobile": n_mobile,

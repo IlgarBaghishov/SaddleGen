@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import random
 import sys
@@ -51,7 +52,10 @@ import matplotlib.pyplot as plt
 
 # Reach the on-scratch data_prep module (official-split loader). Only used to
 # resolve the shards directory + read the train/val/test parquet splits.
-RUN_DIR_DEFAULT = "/scratch/08405/ilgar/SaddleGen_mp20bat"
+# Override via env var so the same script works for v7_0 / v7_2a / v7_2a1a / v7_2b.
+RUN_DIR_DEFAULT = os.environ.get(
+    "SADDLEGEN_RUN_DIR", "/scratch/08405/ilgar/SaddleGen_mp20bat/v7_0",
+)
 sys.path.insert(0, RUN_DIR_DEFAULT)
 from data_prep import ensure_subset, load_official_splits  # noqa: E402
 
@@ -209,6 +213,10 @@ def load_model(ckpt_dir: Path, device: str):
     if not safe_path.is_file():
         raise FileNotFoundError(f"missing {safe_path}")
     state = load_file(str(safe_path))
+    # v7-2a1a: drop the auxiliary `eigenmode_head.*` weights — they are training-
+    # only and are not part of the inference path. Without this filter, every
+    # checkpoint trained with the eigenmode aux head would fail to load here.
+    state = {k: v for k, v in state.items() if not k.startswith("eigenmode_head.")}
     missing, unexpected = loss_module.load_state_dict(state, strict=False)
     print(f"[load] loaded {len(state)} tensors  "
           f"missing={len(missing)}  unexpected={len(unexpected)}")
