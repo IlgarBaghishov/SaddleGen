@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import random
 import sys
@@ -51,7 +52,10 @@ import matplotlib.pyplot as plt
 
 # Reach the on-scratch data_prep module (official-split loader). Only used to
 # resolve the shards directory + read the train/val/test parquet splits.
-RUN_DIR_DEFAULT = "/scratch/08405/ilgar/SaddleGen_mp20bat"
+# Override via env var so the same script works for v7_0 / v7_2a / v7_2a1a / v7_2b.
+RUN_DIR_DEFAULT = os.environ.get(
+    "SADDLEGEN_RUN_DIR", "/scratch/08405/ilgar/SaddleGen_mp20bat/v7_0",
+)
 sys.path.insert(0, RUN_DIR_DEFAULT)
 from data_prep import ensure_subset, load_official_splits  # noqa: E402
 
@@ -145,7 +149,9 @@ def _build_loss_module(config: dict, device: str) -> FlowMatchingLoss:
     backbone_name = extras.get("backbone", "uma-s-1p2")
     inject_str = extras.get("early_time_film_blocks", "-2,-1")
     inject_blocks = [int(s) for s in inject_str.split(",")]
-    inject_force = bool(extras.get("inject_force", True))
+    # NB: train.py writes the key as "force_film" (matching the CLI flag name),
+    # not "inject_force". Read both for backward-compat with older configs.
+    inject_force = bool(extras.get("force_film", extras.get("inject_force", True)))
     unfreeze_last = bool(extras.get("unfreeze_uma_last", True))
     unfreeze_last2 = bool(extras.get("unfreeze_uma_last2", True))
     attn_layers = int(extras.get("attn_layers", 0))
@@ -174,18 +180,63 @@ def _build_loss_module(config: dict, device: str) -> FlowMatchingLoss:
         sphere_channels=sc, lmax=lmax,
         num_heads=attn_heads, num_layers=attn_layers,
     ).to(device)
+    # v7-2b / v7-3: pick up endpoint_features and dimer_force flags from the
+    # run's saved config so the head and FlowMatchingLoss are built identically
+    # to training.
+    endpoint_features_enabled = bool(extras.get("endpoint_features", True))
+    dimer_force_C = int(extras.get("dimer_force_channels", 0))
+    eigenmode_aux_w = float(extras.get("eigenmode_aux_weight", 0.0))
     head = VelocityHead(
         sphere_channels=sc, input_lmax=lmax, depth=head_depth,
         delta_endpoint_channels=delta_C,
         force_field_channels=force_C,
         force_residual=force_residual,
+        endpoint_features_enabled=endpoint_features_enabled,
+        dimer_force_channels=dimer_force_C,
     ).to(device)
     force_head, force_tasks = load_uma_force_head(backbone_name, device=device)
+
+    # v7-3: when the trained checkpoint includes an eigenmode head (because it
+    # was used to drive F_dimer), construct it here too so its weights load and
+    # it can be passed to `sample_saddles`.
+    use_dimer_residual = bool(extras.get("use_dimer_residual", False))
+    dimer_residual_alpha_init = float(extras.get("dimer_residual_alpha_init", 0.0))
+    eigenmode_head = None
+    if eigenmode_aux_w > 0 or dimer_force_C > 0 or use_dimer_residual:
+        from saddlegen.models import EigenmodeHead
+        # v7-4-redesign: EigenmodeHead is a VelocityHead subclass and is
+        # constructed with the same architecture args. Mirror what the
+        # training run did so the saved weights load cleanly.
+        eigenmode_head = EigenmodeHead(
+            sphere_channels=sc, input_lmax=lmax, depth=head_depth,
+            delta_endpoint_channels=delta_C,
+            force_field_channels=force_C,
+            force_residual=False,
+            endpoint_features_enabled=endpoint_features_enabled,
+            dimer_force_channels=0,
+        ).to(device)
+
+    # v7-4-redesign: a SECOND, fully-frozen UMA backbone for force computation
+    # — built ONLY when the training run used it (recorded in extras).
+    frozen_force_backbone = None
+    if bool(extras.get("frozen_force_backbone", False)):
+        frozen_force_backbone = load_uma_backbone(
+            backbone_name, device=device, freeze=True, eval_mode=True,
+            unfreeze_last_block=False,
+        )
+        for p in frozen_force_backbone.parameters():
+            p.requires_grad_(False)
+        frozen_force_backbone.eval()
 
     loss_module = FlowMatchingLoss(
         FlowMatchingConfig(mode=mode, alpha=alpha, R_max_abs=R_max, xt_perturb_sigma=0.0),
         backbone, attn, head,
         force_head=force_head, force_tasks=force_tasks,
+        eigenmode_head=eigenmode_head,
+        eigenmode_loss_weight=eigenmode_aux_w,
+        frozen_force_backbone=frozen_force_backbone,
+        use_dimer_residual=use_dimer_residual,
+        dimer_residual_alpha_init=dimer_residual_alpha_init,
     )
     return loss_module
 
@@ -261,6 +312,11 @@ def run_one_case(record: dict, loss_module: FlowMatchingLoss, *, K: int,
         partner_pos=partner_un,
         force_head=loss_module.force_head,
         force_tasks=loss_module.force_tasks,
+        eigenmode_head=loss_module.eigenmode_head,    # drives F_dimer
+        frozen_force_backbone=loss_module.frozen_force_backbone,    # v7-3 onwards
+        dimer_residual_alpha_mlp=(                                  # v7-4: per-atom α MLP
+            loss_module.dimer_residual_alpha_mlp if loss_module.use_dimer_residual else None
+        ),
     )  # (1, N, 3)
     pred_np = pred[0].detach().cpu().numpy().astype(np.float64)
 
