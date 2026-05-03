@@ -152,7 +152,16 @@ def sample_endpoints(
     mobile = ~sample["fixed"]
 
     if config.mode == 1:
-        x0 = r_start.clone()
+        # v7-2a: start integration from the midpoint between R (start) and P
+        # (partner_un_pos), instead of from R. partner_un_pos is already
+        # MIC-unwrapped relative to start, so the arithmetic mean is the
+        # PBC-correct geodesic midpoint. Re-parameterizes the L2-Bayes-optimal
+        # predictor from `E[saddle] - start ≈ midpoint - start` (large) to
+        # `E[saddle] - midpoint ≈ 0`, forcing the head to use its features to
+        # predict the *residual* deviation of the saddle from the midpoint
+        # instead of rediscovering the midpoint itself.
+        partner = sample["partner_un_pos"]
+        x0 = 0.5 * (r_start + partner)
         x1 = r_saddle
         t = torch.rand((), generator=generator).item()
         return x0, x1, t, mobile
@@ -356,12 +365,17 @@ class FlowMatchingLoss(nn.Module):
             fixed_list.append(sample["fixed"])
 
             if self.config.mode == 1:
-                # Per-atom MIC-shortest displacement from x_t (wrapped) to the
-                # partner. Frozen atoms have partner == start so their delta is
-                # ~0 for the duration of the flow, which is the correct signal
-                # (frozen atoms have no partner-direction).
+                # v7-2a: pass BOTH (R - x_t) and (P - x_t) as per-atom MIC
+                # displacements. Starting from the midpoint, the head needs to
+                # know where both endpoints sit relative to the current point;
+                # passing only the partner (as the v6 head did) loses the
+                # symmetric R-side information. Stacked as (N, 2, 3); the head
+                # now expects a 2-endpoint delta signal.
+                start_pos = sample["start_pos"]
                 partner = sample["partner_un_pos"]
-                delta_partner_list.append(mic_displacement(partner, x_t, sample["cell"]))
+                delta_R = mic_displacement(start_pos, x_t, sample["cell"])
+                delta_P = mic_displacement(partner, x_t, sample["cell"])
+                delta_partner_list.append(torch.stack([delta_R, delta_P], dim=1))
 
         batch_data = data_list_collater(data_list, otf_graph=True).to(device)
         v_target = torch.cat(v_targets, dim=0).to(device)
@@ -371,6 +385,7 @@ class FlowMatchingLoss(nn.Module):
 
         delta_partner_all: torch.Tensor | None = None
         if self.config.mode == 1:
+            # v7-2a: shape is (N_total, 2, 3) — [delta_R, delta_P] per atom.
             delta_partner_all = torch.cat(delta_partner_list, dim=0).to(device)
 
         # Backbone forward needs grad-enabled mode if EITHER the backbone has

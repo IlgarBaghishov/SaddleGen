@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import random
 import sys
@@ -51,7 +52,10 @@ import matplotlib.pyplot as plt
 
 # Reach the on-scratch data_prep module (official-split loader). Only used to
 # resolve the shards directory + read the train/val/test parquet splits.
-RUN_DIR_DEFAULT = "/scratch/08405/ilgar/SaddleGen_mp20bat"
+# Override via env var so the same script works for v7_0 / v7_2a / v7_2a1a / v7_2b.
+RUN_DIR_DEFAULT = os.environ.get(
+    "SADDLEGEN_RUN_DIR", "/scratch/08405/ilgar/SaddleGen_mp20bat/v7_0",
+)
 sys.path.insert(0, RUN_DIR_DEFAULT)
 from data_prep import ensure_subset, load_official_splits  # noqa: E402
 
