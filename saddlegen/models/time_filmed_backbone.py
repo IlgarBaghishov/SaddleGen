@@ -167,10 +167,11 @@ class TimeFiLMBackbone(nn.Module):
         force_film = self.force_films[film_idx] if self.inject_force else None
         def hook(module, args, kwargs):
             if self._t is None or self._batch_idx is None:
-                raise RuntimeError(
-                    "TimeFiLMBackbone forward state not initialised — pre-hook "
-                    "fired without `forward()` having stashed t/batch_idx."
-                )
+                # v7-2b static-featurisation mode: caller invoked
+                # `forward_static(data)` to encode a time-free reference
+                # geometry (R or P). Skip both FiLMs by returning None — the
+                # block then receives `args` and `kwargs` unchanged.
+                return None
             x_message = args[0]
             x_filmed = film(x_message, self._t, self._batch_idx)
             # Force-FiLM is conditionally applied: skip when self._force is None,
@@ -213,3 +214,15 @@ class TimeFiLMBackbone(nn.Module):
             self._t = None
             self._batch_idx = None
             self._force = None
+
+    def forward_static(self, data) -> dict:
+        """v7-2b: run the underlying UMA backbone WITHOUT time-FiLM and WITHOUT
+        force-FiLM. Used to encode a fixed reference geometry (R or P) that
+        carries no notion of time and no on-the-fly forces. The pre-hooks
+        attached to UMA's blocks see `_t = _batch_idx = _force = None` and
+        pass their inputs through unchanged.
+        """
+        self._t = None
+        self._batch_idx = None
+        self._force = None
+        return self.backbone(data)

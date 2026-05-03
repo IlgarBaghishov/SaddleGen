@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import random
 import sys
@@ -51,7 +52,10 @@ import matplotlib.pyplot as plt
 
 # Reach the on-scratch data_prep module (official-split loader). Only used to
 # resolve the shards directory + read the train/val/test parquet splits.
-RUN_DIR_DEFAULT = "/scratch/08405/ilgar/SaddleGen_mp20bat"
+# Override via env var so the same script works for v7_0 / v7_2a / v7_2a1a / v7_2b.
+RUN_DIR_DEFAULT = os.environ.get(
+    "SADDLEGEN_RUN_DIR", "/scratch/08405/ilgar/SaddleGen_mp20bat/v7_0",
+)
 sys.path.insert(0, RUN_DIR_DEFAULT)
 from data_prep import ensure_subset, load_official_splits  # noqa: E402
 
@@ -174,11 +178,15 @@ def _build_loss_module(config: dict, device: str) -> FlowMatchingLoss:
         sphere_channels=sc, lmax=lmax,
         num_heads=attn_heads, num_layers=attn_layers,
     ).to(device)
+    # v7-2b: pick up endpoint_features flag from the run's saved config (default
+    # True for v7-2b runs; the training script writes it to extras).
+    endpoint_features_enabled = bool(extras.get("endpoint_features", True))
     head = VelocityHead(
         sphere_channels=sc, input_lmax=lmax, depth=head_depth,
         delta_endpoint_channels=delta_C,
         force_field_channels=force_C,
         force_residual=force_residual,
+        endpoint_features_enabled=endpoint_features_enabled,
     ).to(device)
     force_head, force_tasks = load_uma_force_head(backbone_name, device=device)
 

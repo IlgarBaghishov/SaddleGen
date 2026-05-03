@@ -152,7 +152,16 @@ def sample_endpoints(
     mobile = ~sample["fixed"]
 
     if config.mode == 1:
-        x0 = r_start.clone()
+        # v7-2a: start integration from the midpoint between R (start) and P
+        # (partner_un_pos), instead of from R. partner_un_pos is already
+        # MIC-unwrapped relative to start, so the arithmetic mean is the
+        # PBC-correct geodesic midpoint. Re-parameterizes the L2-Bayes-optimal
+        # predictor from `E[saddle] - start ≈ midpoint - start` (large) to
+        # `E[saddle] - midpoint ≈ 0`, forcing the head to use its features to
+        # predict the *residual* deviation of the saddle from the midpoint
+        # instead of rediscovering the midpoint itself.
+        partner = sample["partner_un_pos"]
+        x0 = 0.5 * (r_start + partner)
         x1 = r_saddle
         t = torch.rand((), generator=generator).item()
         return x0, x1, t, mobile
@@ -327,6 +336,15 @@ class FlowMatchingLoss(nn.Module):
         t_values: list[float] = []
         fixed_list: list[torch.Tensor] = []
         delta_partner_list: list[torch.Tensor] = []  # only used in Mode 1
+        # v7-2b: collect R and P AtomicData per sample so we can run UMA on the
+        # endpoints in static mode (no time-FiLM, no force-FiLM) and feed the
+        # resulting per-atom features to the velocity head.
+        want_endpoint_features = (
+            self.config.mode == 1
+            and getattr(self.velocity_head, "endpoint_features_enabled", False)
+        )
+        data_list_R: list[AtomicData] = []
+        data_list_P: list[AtomicData] = []
 
         for sample in batch:
             x0, x1, t, _ = sample_endpoints(sample, self.config, generator=generator)
@@ -356,12 +374,34 @@ class FlowMatchingLoss(nn.Module):
             fixed_list.append(sample["fixed"])
 
             if self.config.mode == 1:
-                # Per-atom MIC-shortest displacement from x_t (wrapped) to the
-                # partner. Frozen atoms have partner == start so their delta is
-                # ~0 for the duration of the flow, which is the correct signal
-                # (frozen atoms have no partner-direction).
+                # v7-2a: pass BOTH (R - x_t) and (P - x_t) as per-atom MIC
+                # displacements. Starting from the midpoint, the head needs to
+                # know where both endpoints sit relative to the current point;
+                # passing only the partner (as the v6 head did) loses the
+                # symmetric R-side information. Stacked as (N, 2, 3); the head
+                # now expects a 2-endpoint delta signal.
+                start_pos = sample["start_pos"]
                 partner = sample["partner_un_pos"]
-                delta_partner_list.append(mic_displacement(partner, x_t, sample["cell"]))
+                delta_R = mic_displacement(start_pos, x_t, sample["cell"])
+                delta_P = mic_displacement(partner, x_t, sample["cell"])
+                delta_partner_list.append(torch.stack([delta_R, delta_P], dim=1))
+
+            if want_endpoint_features:
+                # v7-2b: build R and P AtomicData (wrapped into the unit cell so
+                # the OTF graph constructor sees a clean periodic copy).
+                # partner_un_pos is MIC-unwrapped to start; wrap it back for UMA.
+                R_pos = wrap_positions(sample["start_pos"], sample["cell"])
+                P_pos = wrap_positions(sample["partner_un_pos"], sample["cell"])
+                data_list_R.append(build_atomic_data(
+                    R_pos, sample["Z"], sample["cell"],
+                    sample["task_name"], sample["charge"], sample["spin"],
+                    sample["fixed"],
+                ))
+                data_list_P.append(build_atomic_data(
+                    P_pos, sample["Z"], sample["cell"],
+                    sample["task_name"], sample["charge"], sample["spin"],
+                    sample["fixed"],
+                ))
 
         batch_data = data_list_collater(data_list, otf_graph=True).to(device)
         v_target = torch.cat(v_targets, dim=0).to(device)
@@ -371,7 +411,32 @@ class FlowMatchingLoss(nn.Module):
 
         delta_partner_all: torch.Tensor | None = None
         if self.config.mode == 1:
+            # v7-2a: shape is (N_total, 2, 3) — [delta_R, delta_P] per atom.
             delta_partner_all = torch.cat(delta_partner_list, dim=0).to(device)
+
+        # v7-2b: featurize R and P through UMA in static mode FIRST, before the
+        # x_t backbone forward. UMA's MoLE caches per-graph chunk-dispatch
+        # state on each forward; gradient checkpointing on the x_t forward
+        # later re-runs it during backward and asserts that the cached state
+        # matches the current input. If we let R/P forwards run after x_t (but
+        # before backward), MoLE's state is overwritten to R/P's graph and the
+        # x_t backward recomputation explodes with a shape-mismatch assert.
+        # By running R and P first, the LAST forward before backward is x_t
+        # (and v6's second pass is also on x_t), so MoLE's state is consistent
+        # with what backward expects.
+        endpoint_features_all: torch.Tensor | None = None
+        if want_endpoint_features:
+            if not isinstance(self.backbone, TimeFiLMBackbone):
+                raise RuntimeError(
+                    "v7-2b endpoint features require a TimeFiLMBackbone wrapper "
+                    "(it provides forward_static)."
+                )
+            R_batch = data_list_collater(data_list_R, otf_graph=True).to(device)
+            P_batch = data_list_collater(data_list_P, otf_graph=True).to(device)
+            with torch.no_grad():
+                R_feat = self.backbone.forward_static(R_batch)["node_embedding"]
+                P_feat = self.backbone.forward_static(P_batch)["node_embedding"]
+            endpoint_features_all = torch.cat([R_feat, P_feat], dim=-1).detach()
 
         # Backbone forward needs grad-enabled mode if EITHER the backbone has
         # trainable params (v1+ unfreezes blocks[-1]) OR we need to compute
@@ -428,12 +493,15 @@ class FlowMatchingLoss(nn.Module):
                     with torch.no_grad():
                         feat = self.backbone(batch_data, t_tensor, batch_idx, force=force_field_all)
 
+        # endpoint_features_all was computed above (BEFORE the x_t forward) so
+        # MoLE state remains consistent with the x_t backward recompute.
         x = feat["node_embedding"]
         x = self.global_attn(x, batch_idx)
         v = self.velocity_head(
             x, t_tensor, batch_idx,
             delta_endpoint=delta_partner_all,
             force_field=force_field_all,
+            endpoint_features=endpoint_features_all,
         )
         v = apply_output_projections(v, fixed_all, batch_idx, num_systems=B)
 

@@ -42,15 +42,16 @@ def sample_saddles(
     partner conditioning. `velocity_head` must be a Mode-0 head
     (`delta_endpoint_channels == 0`). Caller does NOT pass `partner_pos`.
 
-    **Mode 1 (`partner_pos` provided).** Product-conditional flow. The head is
-    Mode 1 (`delta_endpoint_channels > 0`) and at each Euler step we feed it
-    the per-atom MIC-shortest displacement from the current x_t to the partner
-    (the OTHER local minimum — P when starting from R, R when starting from P).
-    Mode 1 is deterministic given `partner_pos`; you typically pass `sigma_inf=0`
-    and `n_perturbations=1` to get a single deterministic prediction. To still
-    get a small ensemble (for clustering / robustness), pass a small `sigma_inf`
-    and >1 perturbations — the partner conditioning will keep all trajectories
-    aimed at the same saddle.
+    **Mode 1 (`partner_pos` provided).** Product-conditional flow.
+    **v7-2a:** integration starts at the (R, P) midpoint instead of at R, and
+    the head receives BOTH (R - x_t) and (P - x_t) per atom (stacked as
+    (P*N, 2, 3)). The matching trainer in `FlowMatchingLoss.forward` uses the
+    same x_0 = midpoint and the same 2-endpoint signal, so train/test are
+    aligned. The head must be built with `delta_endpoint_channels > 0` and its
+    `delta_proj` input must accept 2 channels (handled automatically by the
+    v7-2a `VelocityHead.__init__`). Mode 1 is deterministic given
+    `partner_pos`; you typically pass `sigma_inf=0` and `n_perturbations=1` to
+    get a single deterministic prediction.
 
     Args:
         reactant: a sample dict with the same keys used by `FlowMatchingLoss`
@@ -133,7 +134,15 @@ def sample_saddles(
         dim=0,
     ).to(device)  # (n_perturbations, N, 3)
 
-    x = wrap_positions(r_R.unsqueeze(0) + eps_stack, cell)  # (n_perturbations, N, 3)
+    # v7-2a: integration starts from the (R, P) midpoint instead of from R, to
+    # match training-time x_0 in `sample_endpoints`. partner_un_pos is already
+    # MIC-unwrapped relative to start, so the arithmetic mean is the
+    # PBC-correct geodesic midpoint.
+    if partner is not None:
+        x_init = 0.5 * (r_R + partner)
+    else:
+        x_init = r_R
+    x = wrap_positions(x_init.unsqueeze(0) + eps_stack, cell)  # (n_perturbations, N, 3)
 
     if return_trajectory:
         traj = torch.empty(K + 1, n_perturbations, N, 3, device=device, dtype=x.dtype)
@@ -141,6 +150,37 @@ def sample_saddles(
 
     fixed_all = fixed.repeat(n_perturbations)  # (n_perturbations * N,)
     dt = 1.0 / K
+
+    # v7-2b: featurise R and P through UMA in static mode ONCE before the K-step
+    # loop, then reuse the cached features at every step. Tile each per atom by
+    # n_perturbations so the per-atom layout aligns with x_t's flat (P*N, …).
+    endpoint_features_all_inf: torch.Tensor | None = None
+    want_endpoint_features = (
+        getattr(velocity_head, "endpoint_features_enabled", False)
+        and partner is not None
+    )
+    if want_endpoint_features:
+        from .matching import build_atomic_data
+        if not isinstance(backbone, TimeFiLMBackbone):
+            raise RuntimeError(
+                "v7-2b endpoint features need a TimeFiLMBackbone (forward_static)."
+            )
+        R_pos_w = wrap_positions(r_R, cell)
+        P_pos_w = wrap_positions(partner, cell)
+        R_data_list = [
+            build_atomic_data(R_pos_w, Z, cell, task_name, charge, spin, fixed)
+            for _ in range(n_perturbations)
+        ]
+        P_data_list = [
+            build_atomic_data(P_pos_w, Z, cell, task_name, charge, spin, fixed)
+            for _ in range(n_perturbations)
+        ]
+        R_batch_inf = data_list_collater(R_data_list, otf_graph=True).to(device)
+        P_batch_inf = data_list_collater(P_data_list, otf_graph=True).to(device)
+        with torch.no_grad():
+            R_feat_inf = backbone.forward_static(R_batch_inf)["node_embedding"]
+            P_feat_inf = backbone.forward_static(P_batch_inf)["node_embedding"]
+        endpoint_features_all_inf = torch.cat([R_feat_inf, P_feat_inf], dim=-1).detach()
 
     # Inference loop. We can't use a global @torch.no_grad() decorator like
     # the v0 sampler did — v2's force computation needs autograd through the
@@ -160,13 +200,18 @@ def sample_saddles(
 
         delta_partner_all: torch.Tensor | None = None
         if partner is not None:
-            # Per-atom MIC displacement from each trajectory's current x[i] to
-            # the (shared) partner. (n_perturbations, N, 3) -> flat (P*N, 3).
-            delta_each = torch.stack(
-                [mic_displacement(partner, x[i], cell) for i in range(n_perturbations)],
-                dim=0,
+            # v7-2a: pass BOTH (R - x_t) and (P - x_t) per atom. Stacked as
+            # (n_perturbations, N, 2, 3) → flat (P*N, 2, 3) to match the head's
+            # n_delta_endpoints=2 expectation.
+            delta_R_each = torch.stack(
+                [mic_displacement(r_R,    x[i], cell) for i in range(n_perturbations)], dim=0,
             )  # (n_perturbations, N, 3)
-            delta_partner_all = delta_each.reshape(-1, 3)
+            delta_P_each = torch.stack(
+                [mic_displacement(partner, x[i], cell) for i in range(n_perturbations)], dim=0,
+            )  # (n_perturbations, N, 3)
+            delta_partner_all = torch.stack(
+                [delta_R_each, delta_P_each], dim=2,                                         # (P, N, 2, 3)
+            ).reshape(-1, 2, 3)                                                              # (P*N, 2, 3)
 
         is_v6_force_film = (
             isinstance(backbone, TimeFiLMBackbone)
@@ -205,6 +250,7 @@ def sample_saddles(
                 h, t_tensor, batch_idx,
                 delta_endpoint=delta_partner_all,
                 force_field=force_field_all,
+                endpoint_features=endpoint_features_all_inf,
             )
             v = apply_output_projections(v, fixed_all, batch_idx, num_systems=n_perturbations)
             v = v.view(n_perturbations, N, 3)
